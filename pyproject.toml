@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pome"
+version = "0.1.0"
+description = "POME: Partially observed mixed-type data embeddings"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "torch",
+    "torch-geometric",
+    "networkx"
+]
+authors = [
+  { name = "Fabian Woller"}
+]
+license = { text = "GPL-3.0-only" }
+keywords = ["representation-learning", "graphs", "embeddings"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
