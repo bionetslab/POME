@@ -9,8 +9,8 @@ import numpy as np
 from torch_geometric.seed import seed_everything
 from sklearn.base import BaseEstimator, ClassifierMixin
 import joblib
-from gnn_embeddings.models import GraphAutoencoder
-from gnn_embeddings.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted
+from pome.models import GraphAutoencoder
+from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
