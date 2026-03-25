@@ -1,6 +1,6 @@
 # POME: Learning partially observed mixed-type data embeddings 
 ![Tests](https://github.com/bionetslab/POME/actions/workflows/tests.yaml/badge.svg)
-![Coverage](https://github.com/bionetslab/POME/tree/gh-pages/badges/coverage.svg)
+![Coverage](https://raw.githubusercontent.com/bionetslab/POME/gh-pages/badges/coverage.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 
 POME is a graph-based representation-learning method for heterogeneous datasets that incorporates missingness structures into the computation of low-dimensional sample and variable embeddings. It is applicable to any tabular datasets consisting of both numeric- and categorical-type features, where missing data patterns are supposed to be taken into account.
