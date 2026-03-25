@@ -25,3 +25,19 @@ keywords = ["representation-learning", "graphs", "embeddings", "missing data"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--cov=pome --cov-report=term-missing"
+
+[tool.coverage.run]
+omit = [
+    "*/__init__.py",
+]

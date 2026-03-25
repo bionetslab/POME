@@ -3,22 +3,11 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import zscore
 import numpy as np
-import os 
-from torch_geometric.seed import seed_everything
 
-
-def link_similarity(embeddings, edge_index, decoder_model=None, measure='dot'):
+def link_similarity(embeddings, edge_index, decoder_model=None):
     u, v = edge_index  # Extract node pairs
-    if measure=='dot':
-        similarities = (embeddings[u] * embeddings[v]).sum(dim=1)
-        return (similarities+1)/2.0
-    elif measure=='decoder':
-        if decoder_model is None:
-            raise ValueError("Decoder model must be provided when using 'decoder' measure.")
-        similarities = decoder_model(embeddings, edge_index)
-        return similarities
-    else:
-        raise ValueError(f'Unknown measure mode: {measure}.')
+    similarities = decoder_model(embeddings, edge_index)
+    return similarities
 
 
 def compute_roc(graph_data, neg_edges_per_pair, node_embeddings, decoder_model):
@@ -29,8 +18,8 @@ def compute_roc(graph_data, neg_edges_per_pair, node_embeddings, decoder_model):
     neg_edge_index = torch.cat(neg_edges_per_pair, dim=1).to(device)
 
     # Compute link probabilities using dot-product.
-    pos_scores = link_similarity(node_embeddings, pos_edge_index, decoder_model=decoder_model, measure='decoder')
-    neg_scores = link_similarity(node_embeddings, neg_edge_index, decoder_model=decoder_model, measure='decoder')
+    pos_scores = link_similarity(node_embeddings, pos_edge_index, decoder_model=decoder_model)
+    neg_scores = link_similarity(node_embeddings, neg_edge_index, decoder_model=decoder_model)
     
     # Merge scores and labels for ROC computation using decoder-based similarity.
     y_true = torch.cat([torch.ones(pos_scores.size(0)), torch.zeros(neg_scores.size(0))]).detach()
@@ -93,9 +82,6 @@ def bin_column_with_na_adjusted(column, K, true_missing, keep_nas):
 
 def signed_power_bins(data, n_bins, power=2):
     data = np.asarray(data, dtype=float)
-
-    if data.size == 0:
-        return np.array([]), np.array([])
 
     # Forward transform (power, NOT root!)
     transformed = np.sign(data) * np.abs(data) ** power
@@ -166,18 +152,3 @@ def repeat_pad_to_max_cols(tensor_list):
 
     return torch.stack(padded_list)  # shape: (B, 2, max_cols)
 
-def embedder_ap_scorer(estimator, X, y=None):
-    return estimator.return_ap_score()
-
-def make_utils_deterministic(seed):
-    # 1. Basic seeding
-    seed_everything(seed)
-    
-    # 2. PyTorch specific
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    # 3. Handle potential hashing randomness
-    os.environ["PYTHONHASHSEED"] = str(seed)

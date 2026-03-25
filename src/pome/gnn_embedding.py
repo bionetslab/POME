@@ -40,7 +40,8 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  file_name : str = None,
                  output_path : str = None,
                  discretization_type : str = "z",
-                 enable_imputation : bool = False
+                 enable_imputation : bool = False,
+                 epoch_checkpoints : int = -1,
                  ):
         self.embedding_dimension=embedding_dimension
         self.bins_per_continuous=bins_per_continuous
@@ -57,6 +58,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.output_path = output_path
         self.discretization_type = discretization_type
         self.enable_imputation = enable_imputation
+        self.save_epochs = epoch_checkpoints
 
     def fit(self, X, y=None):
         """Sklearn-based fit method for given tabular df.
@@ -107,23 +109,20 @@ class Embedder(BaseEstimator, ClassifierMixin):
         return self
     
     def return_ap_score(self):
-        if self._ap is None:
-            raise ValueError("Error: model has not been trained yet, no AP exists.")
-        else:
-            return self._ap
+        return self._ap
     
     def decision_function(self, X):
         """Not used in this setup."""
         return np.array([])  # placeholder
     
 
-    def get_embeddings(self, format='pandas'):
+    def get_embeddings(self):
         """Extract given set of precomputed embeddings.
         Args:
             sample_subset (list[int], optional): List of sample indices whose embeddings to return. Defaults to None.
         """
         if not hasattr(self, '_all_embeddings'):
-            print("Run fit() first before extracting sample embeddings!")
+            raise ValueError("Run fit() first before extracting sample embeddings!")
         else:
             embedding_matrix = self._all_embeddings
             variable_matrix = self._variable_embeddings
@@ -131,23 +130,20 @@ class Embedder(BaseEstimator, ClassifierMixin):
             sample_rows = list(self._sample_node_dict.values())
             sample_embedding_matrix = embedding_matrix[sample_rows]
             sample_to_attention_index = {sample: row for row, sample in enumerate(self._sample_node_dict.keys())}
-            if format=='pandas':
-                # Initialize sample embedding matrix.
-                sample_embedding_matrix = sample_embedding_matrix.numpy()
-                embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
-                embedding_rows = list(self._X.columns)
-                embedding_df = pd.DataFrame(sample_embedding_matrix, index=embedding_rows, columns=embedding_cols)
-                # Init variable embeddings df.
-                variable_rows = self._variable_names
-                variable_cols = embedding_cols
-                variable_df = pd.DataFrame(variable_matrix, index=variable_rows, columns=variable_cols)
-                # Init cont-bin embeddings df.
-                bin_rows = self._cont_bin_names
-                bin_cols = embedding_cols
-                bin_df = pd.DataFrame(bin_matrix, index=bin_rows, columns=bin_cols)
-                return embedding_df, variable_df, bin_df, sample_to_attention_index
-            elif format=='torch':
-                return sample_embedding_matrix, variable_matrix, bin_matrix, sample_to_attention_index
+            # Initialize sample embedding matrix.
+            sample_embedding_matrix = sample_embedding_matrix.numpy()
+            embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
+            embedding_rows = list(self._X.columns)
+            embedding_df = pd.DataFrame(sample_embedding_matrix, index=embedding_rows, columns=embedding_cols)
+            # Init variable embeddings df.
+            variable_rows = self._variable_names
+            variable_cols = embedding_cols
+            variable_df = pd.DataFrame(variable_matrix, index=variable_rows, columns=variable_cols)
+            # Init cont-bin embeddings df.
+            bin_rows = self._cont_bin_names
+            bin_cols = embedding_cols
+            bin_df = pd.DataFrame(bin_matrix, index=bin_rows, columns=bin_cols)
+            return embedding_df, variable_df, bin_df, sample_to_attention_index
 
     def impute_all(self, na_value : float):
         """Impute missing values for all samples in dataframe based on fitted node embeddings.
@@ -155,6 +151,10 @@ class Embedder(BaseEstimator, ClassifierMixin):
         Args:
             na_value (float): Impute all data entries that possess this missing value encoder.
         """
+        
+        if self.enable_imputation == False:
+            raise ValueError("Embedder object has not been initialized with enable_imputation=True. Please re-train.")
+        
         samples = list(self._discretized_data.columns)
         aggregated_df = pd.DataFrame(index=self._X.index)
         for sample in samples:
@@ -226,12 +226,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """Move all tensor-like attributes of self to given device."""
         for name, value in self.__dict__.items():
             if hasattr(value, "to") and callable(value.to):
-                try:
-                    self.__dict__[name] = value.to(device)
-                except Exception:
-                    pass  # skip objects that cannot be moved
+                self.__dict__[name] = value.to(device)
 
-    def train_gnn(self, autoencoder, optimizer, graph_data, save_epochs=-1):
+    def train_gnn(self, autoencoder, optimizer, graph_data):
         neg_edges_list = [val for _, val in self._neg_edges_per_pair.items() if val.numel()>0]
         neg_edges_tensor = repeat_pad_to_max_cols(neg_edges_list) 
         
@@ -271,7 +268,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 print(f"Step {epoch}: loss = {loss.item()}")
                 #print(f"Epoch {epoch} | Sample: {sample_time:.2f}ms | Forward: {forward_time:.2f}ms | Backward: {backward_time:.2f}ms")
                 
-            if self.file_name and save_epochs > 0 and (epoch+1) % save_epochs == 0 and epoch > 0:
+            if self.file_name and self.save_epochs > 0 and (epoch+1) % self.save_epochs == 0 and epoch > 0:
                 # Save currently fitted decoder and embeddings to self.
                 node_embeddings, _, _ = autoencoder.get_embeddings(graph_data.edge_index)
                 self._all_embeddings = node_embeddings

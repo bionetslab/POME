@@ -10,11 +10,7 @@ class GraphEncoder(torch.nn.Module):
         layer_type = layer_type.upper()
 
         # Pick the right layer constructor
-        if layer_type == "GCN":
-            Layer = GCNConv
-        elif layer_type == "SAGE":
-            Layer = SAGEConv
-        elif layer_type == "GAT":
+        if layer_type == "GAT":
             Layer = GATConv
         else:
             raise ValueError(f"Unknown layer_type: {layer_type}. Choose from ['GCN', 'GAT', 'SAGE']")
