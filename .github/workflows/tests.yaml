@@ -19,8 +19,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install package
-        run: python -m pip install --upgrade pip setuptools wheel
-        run: pip install -e .[dev]
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .[dev]
 
       - name: Run tests with coverage
         run: pytest --cov=pome --cov-report=xml
