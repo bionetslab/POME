@@ -2,13 +2,18 @@
 ![Tests](https://github.com/bionetslab/POME/actions/workflows/tests.yaml/badge.svg)
 ![Coverage Status](./coverage.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![PyPI](https://img.shields.io/pypi/v/pome-py?color=orange)
 
 POME is a graph-based representation-learning method for heterogeneous datasets that incorporates missingness structures into the computation of low-dimensional sample and variable embeddings. It is applicable to any tabular datasets consisting of both numeric- and categorical-type features, where missing data patterns are supposed to be taken into account.
 
 ## Installation
-POME is implemented as a Python package and is easily installable from this repository by running
+POME is implemented as a Python package and is easily installable from PyPI by running
 ```
-pip install -e .
+pip install pome-py
+```
+or locally from this repository by running
+```
+pip install .
 ```
 
 ## Input format
@@ -62,9 +67,9 @@ POME's Embedder class allows for the specification of the following parameters:
 
 After initializing the Embedder object, the main three functions for using POME are:
 
-- `fit(self, X, y=None)`: Training POME on the given input dataframe, with the input format as specified above.
-- `get_embeddings(self, format='pandas')`: Return computed embeddings of samples and variables in dataframe format. Output is a four-tuple with sample embeddings in at position 0, and variable embeddings at position 1.
-- `impute_all(self, na_value : float)`: Imputes all missing values specified by `na_value` in the input dataset, and directly returns the imputed dataframe.
+- `fit(X, y=None)`: Training POME on the given input dataframe, with the input format as specified above.
+- `get_embeddings()`: Return computed embeddings of samples and variables in dataframe format. Output is a four-tuple with sample embeddings in at position 0, and variable embeddings at position 1.
+- `impute_all(na_value : float)`: Imputes all missing values specified by `na_value` in the input dataset, and directly returns the imputed dataframe.
 
 
 
