@@ -1,4 +1,5 @@
 # POME: Learning partially observed mixed-type data embeddings 
+![Tests](https://github.com/bionetslab/POME/actions/workflows/tests.yaml/badge.svg)
 
 POME is a graph-based representation-learning method for heterogeneous datasets that incorporates missingness structures into the computation of low-dimensional sample and variable embeddings. It is applicable to any tabular datasets consisting of both numeric- and categorical-type features, where missing data patterns are supposed to be taken into account.
 
@@ -53,7 +54,6 @@ POME's Embedder class allows for the specification of the following parameters:
 - `device : str = "cpu"`: Specifies whether to train on CPU ("cpu") or GPU ("cuda").
 - `na_encoding : float = -99.0`: The float encoding value of missing data.
 - `enable_imputation : bool = False`: Set this to true if you want to use POME for imputation after training.
-
 
 
 ## Functions
