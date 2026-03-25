@@ -8,44 +8,37 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-
-    # Necessary for the workflow to push changes back to the repo
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          # Fetches all history so the push doesn't fail on a shallow clone
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install package
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip
           pip install -e .[dev]
+          pip install coverage-badge  # Simple tool to make the SVG
 
       - name: Run tests with coverage
         run: |
-          pytest --cov=pome \
-                 --cov-report=json:coverage.json
+          pytest --cov=pome
 
-      - name: Generate coverage badge
-        # Only generate the badge on the default branch
+      - name: Generate Badge File
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        uses: we-cli/coverage-badge-action@main
+        run: |
+          # This creates 'coverage.svg' in your root folder
+          coverage-badge -o coverage.svg -f
 
       - name: Commit and push coverage badge
-        # Only push the badge on the default branch
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: update coverage badge [skip ci]"
           file_pattern: 'coverage.svg'
-          # Prevents the action from failing if coverage hasn't changed
-          skip_dirty_check: false
