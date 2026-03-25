@@ -21,7 +21,7 @@ authors = [
   { name = "Fabian Woller"}
 ]
 license = { text = "GPL-3.0-only" }
-keywords = ["representation-learning", "graphs", "embeddings"]
+keywords = ["representation-learning", "graphs", "embeddings", "missing data"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

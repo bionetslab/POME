@@ -35,7 +35,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  device="cpu",
                  layer_type="GAT",
                  type_column : str = "type",
-                 non_informative_na : float = -99.0,
+                 na_encoding : float = -99.0,
                  informative_nas : list = [],
                  file_name : str = None,
                  output_path : str = None,
@@ -51,7 +51,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.num_nodes = None
         self.model = None
         self.type_column = type_column
-        self.non_informative_na = non_informative_na
+        self.non_informative_na = na_encoding
         self.informative_nas = informative_nas
         self.file_name = file_name
         self.output_path = output_path
@@ -117,7 +117,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         return np.array([])  # placeholder
     
 
-    def get_sample_embeddings(self, format='pandas'):
+    def get_embeddings(self, format='pandas'):
         """Extract given set of precomputed embeddings.
         Args:
             sample_subset (list[int], optional): List of sample indices whose embeddings to return. Defaults to None.
@@ -149,7 +149,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
             elif format=='torch':
                 return sample_embedding_matrix, variable_matrix, bin_matrix, sample_to_attention_index
 
-    def impute_all(self, na_value : float, cont_imputation_mode='best_bin'):
+    def impute_all(self, na_value : float):
         """Impute missing values for all samples in dataframe based on fitted node embeddings.
 
         Args:
@@ -158,11 +158,11 @@ class Embedder(BaseEstimator, ClassifierMixin):
         samples = list(self._discretized_data.columns)
         aggregated_df = pd.DataFrame(index=self._X.index)
         for sample in samples:
-            imputed_sample_df = self.impute_sample(sample, na_value, cont_imputation_mode)
+            imputed_sample_df = self.impute_sample(sample, na_value)
             aggregated_df[sample] = imputed_sample_df[sample]
         return aggregated_df
     
-    def impute_sample(self, sample_colum : str, na_value : float, cont_imputation_mode="best_bin"):
+    def impute_sample(self, sample_colum : str, na_value : float):
         """Impute missing values for given sample in dataframe based on fitted node embeddings.
 
         Args:
@@ -171,9 +171,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """
         if not self.enable_imputation:
             raise ValueError("Embedder object was created without imputation setup. Please reinstantiate Embedder object with enable_imputation=True.")
-        
-        if not sample_colum in self._discretized_data.columns:
-            raise ValueError("Given sample column is not contained in input data.")
         
         imputed_df = self._X.copy()
         # Extract all positions (i.e. variables) in given sample that possess this missing value.
@@ -212,101 +209,18 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 imputed_df.loc[variable, sample_colum] = category_value
 
             elif variable in self._cont_vars:
-                if cont_imputation_mode=='attention_based':
-                    imputed_value = self._impute_cont_using_attention_average(sample_colum, variable)
-                elif cont_imputation_mode=='weighted_bins':
-                    imputed_value = self._impute_cont_using_weighted_average(sample_colum, variable)
-                elif cont_imputation_mode=='best_bin':
-                    bin_patients = self._discretized_data.columns[
-                        self._discretized_data.loc[variable] == category_value
-                        ].tolist()
-                    if bin_patients:
-                        imputed_value = self._X.loc[variable, bin_patients].mean()
-                    else:
-                        imputed_value = np.nan  # or global mean or other fallback
+                bin_patients = self._discretized_data.columns[
+                    self._discretized_data.loc[variable] == category_value
+                    ].tolist()
+                if bin_patients:
+                    imputed_value = self._X.loc[variable, bin_patients].mean()
                 else:
-                    raise ValueError(f'Unknown continuous imputation mode: {cont_imputation_mode}')
+                    imputed_value = np.nan  # or global mean or other fallback
 
                 imputed_df.loc[variable, sample_colum] = imputed_value
 
         return imputed_df
 
-    def impute_cont_using_best_bin_average(self, sample : str, variable : str, exclude_sample = False):
-        # Retrieve for each sample & category node the respective embeddings.
-        potential_categories = [value for value, is_not_na in self._var_value_dict[variable] if is_not_na]
-        category_indices = torch.tensor(
-            [self._value_node_dict[value] for value in potential_categories],
-            dtype=torch.long,
-            device=self._all_embeddings.device
-        )
-        sample_index = torch.tensor(
-            [self._sample_node_dict[sample]] * len(potential_categories),
-            dtype=torch.long,
-            device=self._all_embeddings.device
-        )
-
-        # Torch tensor setup with edge index shape [2, num_potential_categories].
-        edge_index = torch.stack([sample_index, category_indices])
-
-        # Get sample-category similarity scores from fitted decoder.
-        with torch.no_grad():
-            similarities = self._fitted_decoder(self._all_embeddings, edge_index)
-
-        # Find category with highest similarity.
-        best_idx = torch.argmax(similarities).item()
-        closest_value = potential_categories[best_idx]
-        # Extract value from category name.
-        category_value = float(closest_value.split("=")[1])
-
-        best_bin_samples = set(self._discretized_data.columns[
-                                   self._discretized_data.loc[variable] == category_value
-                                   ])
-        if exclude_sample:
-            best_bin_samples = best_bin_samples - set(sample)
-
-        if len(best_bin_samples) > 0:
-            return self._X.loc[variable, list(best_bin_samples)].mean()
-        else:
-            return np.nan
-
-    def impute_cont_using_weighted_average(self, sample : str, var : str, exclude_sample = False):
-        sample_id = self._sample_node_dict[sample]
-        # Only select non-NA bins for current variable.
-        non_na_bins = [x[0] for x in self._var_value_dict[var] if x[1] == True]
-
-        # Iterate once over all non-NA bins to compute softmax-ed similarities.
-        sample_bin_edges = [[], []]
-        for variable_bin in non_na_bins:
-            bin_id = self._value_node_dict[variable_bin]
-            sample_bin_edges[0].append(sample_id)
-            sample_bin_edges[1].append(bin_id)
-        # Run fitted decoder to obtain sample-bin similarities.
-        sample_bin_sim = self._fitted_decoder(self._all_embeddings, sample_bin_edges)
-        sample_bin_probs = F.softmax(sample_bin_sim, dim=0)
-
-        # Again iterate over all non-NA bin and compute weighted imputation value, including attention weights.
-        only_empty_bins = True
-        imputed_value = 0.0
-        for bin_id, variable_bin in enumerate(non_na_bins):
-            sample_bin_prob = sample_bin_probs[bin_id]
-            # Compute unweighted mean over all sample values in current bin.
-            bin_value = float(variable_bin.split("=")[1])
-            bin_patients = set(self._discretized_data.columns[
-                self._discretized_data.loc[var] == bin_value
-                ])
-            if exclude_sample:
-                bin_patients = bin_patients - {sample}
-            if len(bin_patients)>0:
-                bin_average = self._X.loc[var, list(bin_patients)].mean()
-                only_empty_bins = False
-                imputed_value += sample_bin_prob * bin_average
-            else: # In case there are no samples in corresponding bin, ignore this bin.
-                continue
-
-        if only_empty_bins:
-            return np.nan
-        else:
-            return float(imputed_value)
 
     def _move_self_tensors(self, device):
         """Move all tensor-like attributes of self to given device."""
@@ -544,104 +458,3 @@ class Embedder(BaseEstimator, ClassifierMixin):
         return (data, graph_data, num_variables, sample_node_ids, value_node_ids, 
                 var_value_dict, neg_edges_per_pair, variable_names, variable_embedding_ids,
                 cont_bin_names, cont_bin_embedding_ids)
-
-if __name__ == "__main__":
-    
-    NON_INFORMATIVE_NA = -99.0
-    INFORMATIVE_NAS = []
-    device = "cuda"
-    FILE_NAME = "data/input/mimic_aggregated_with_targets.tsv"
-    OUT_PATH = "/data/bionets/xa39zypy/graph_based_embeddings.git/data/preprocessed/graph_based/MIMIC/with_target_embeddings"
-    dataset = 'MIMIC'
-    df = pd.read_csv(FILE_NAME, index_col=0, sep='\t')
-    
-    input_params = {'non_informative_na' : NON_INFORMATIVE_NA, 'informative_nas' : INFORMATIVE_NAS, "device" : device}
-    opt = dict()
-    embedder_params = opt | input_params
-    
-    embedder_params["embedding_dimension"]=16
-    for i in range(10):
-        print("Running embedding = ", i)
-        make_deterministic(i)
-        embedder = Embedder( 
-                           epochs=2000,
-                           **embedder_params
-                           )
-        embedder.fit(df.copy())
-        
-        sample_df, var_df, bin_df, _ = embedder.get_sample_embeddings()
-        emb_dim = embedder_params["embedding_dimension"]
-
-        sample_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_samples_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-        var_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_variables_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-        bin_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_bins_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-    
-    embedder_params["embedding_dimension"]=32
-    for i in range(10):
-        print("Running embedding = ", i)
-        make_deterministic(i)
-        embedder = Embedder( 
-                           epochs=2000,
-                           **embedder_params
-                           )
-        embedder.fit(df.copy())
-        
-        sample_df, var_df, bin_df, _ = embedder.get_sample_embeddings()
-        emb_dim = embedder_params["embedding_dimension"]
-
-        sample_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_samples_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-        var_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_variables_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-        bin_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_bins_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-    
-    embedder_params["embedding_dimension"]=64
-    for i in range(10):
-        print("Running embedding = ", i)
-        make_deterministic(i)
-        embedder = Embedder( 
-                           epochs=2000,
-                           **embedder_params
-                           )
-        embedder.fit(df.copy())
-        
-        sample_df, var_df, bin_df, _ = embedder.get_sample_embeddings()
-        emb_dim = embedder_params["embedding_dimension"]
-
-        sample_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_samples_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-        var_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_variables_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )
-        bin_df.to_csv(
-            os.path.join(OUT_PATH, f"{dataset}_bins_{emb_dim}_{i}.tsv"),
-            sep="\t",
-            index=True
-        )

@@ -6,35 +6,6 @@ import numpy as np
 import os 
 from torch_geometric.seed import seed_everything
 
-def get_all_negative_edges(graph_data):
-    edge_index = graph_data.unique_edges
-    num_samples = graph_data.num_samples
-    num_nodes = graph_data.num_nodes
-    # Compute negative edge
-    a_nodes = torch.arange(num_samples)
-    b_nodes = torch.arange(num_samples, num_nodes)
-
-    # 2. Keep only edges from A to B
-    mask = (edge_index[0] < num_samples) & (edge_index[1] >= num_samples)
-    existing_edges = edge_index[:, mask]
-
-    # 3. Create all possible edges from A to B
-    A, B = torch.meshgrid(a_nodes, b_nodes, indexing='ij')
-    all_possible_edges = torch.stack([A.reshape(-1), B.reshape(-1)], dim=0)
-
-    # 4. Remove existing edges
-    existing_set = set(map(tuple, existing_edges.t().tolist()))
-    all_set = set(map(tuple, all_possible_edges.t().tolist()))
-
-    negative_edges = all_set - existing_set
-
-    # 5. Convert to tensor if there are any negative edges
-    if negative_edges:
-        negative_edge_index = torch.tensor(list(negative_edges)).t()
-    else:
-        negative_edge_index = torch.empty((2, 0), dtype=torch.long)
-    return negative_edge_index
-
 
 def link_similarity(embeddings, edge_index, decoder_model=None, measure='dot'):
     u, v = edge_index  # Extract node pairs
@@ -141,37 +112,6 @@ def signed_power_bins(data, n_bins, power=2):
 
     return edges, bins
 
-def bin_column_percentile(column, K, true_missing, keep_nas):
-    column = column.copy()  # Avoid modifying the original data
-    column = column.astype(float)
-    
-    # Identify different types of missing values
-    true_missing_mask = column == true_missing
-    keep_nas_mask = column.isin(keep_nas)
-    valid_mask = ~(true_missing_mask | keep_nas_mask | column.isna())
-
-    # Extract non-missing values for binning
-    non_na = column[valid_mask]
-
-    if len(set(non_na)) == 1:
-        binned_non_na = np.full(len(non_na), (K-1)//2)
-    else:
-        binned_non_na = pd.qcut(non_na, q=K, labels=False, duplicates="drop")
-
-    # Create full binned column initialized with NA
-    binned_full = pd.Series(pd.NA, index=column.index, dtype="Int64")
-
-    # Assign binned values
-    binned_full[valid_mask] = binned_non_na
-    
-    # Assign separate negative bins to keep_nas values
-    for missing_val in keep_nas:
-        binned_full[column == missing_val] = missing_val
-
-    # Assign true missing value (-99) to pd.NA
-    binned_full[true_missing_mask] = true_missing
-    
-    return binned_full.astype("float64")
 
 def bin_column_non_linear(column, K, true_missing, keep_nas):
     column = column.copy()  # Avoid modifying the original data
