@@ -10,7 +10,7 @@ from torch_geometric.seed import seed_everything
 from sklearn.base import BaseEstimator, ClassifierMixin
 import joblib
 from pome.models import GraphAutoencoder
-from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted
+from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
@@ -72,7 +72,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """
         # Translate input data into graph based format.
         input_data = X.copy()
-        discrete_data, graph_data, _, sample_node_dict, value_node_dict, var_value_dict, neg_edges_per_pair, variable_names, variable_embedding_ids, cont_bin_names, cont_bin_embedding_ids = self.data_to_graph(
+        discrete_data, graph_data, _, sample_node_dict, value_node_dict, var_value_dict, neg_edges_per_pair, variable_names, variable_embedding_ids, cont_bin_names, cont_bin_embedding_ids, bin_stats = self.data_to_graph(
                           input_data,
                           dtype_col=self.type_column,
                           ignore_na=self.non_informative_na,
@@ -85,21 +85,23 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self._variable_names = variable_names
         self._cont_bin_names = cont_bin_names
         self._X = input_data
-        
+        self._value_node_dict = value_node_dict
+        self._bin_stats = bin_stats
+
         if self.enable_imputation:
             self._discretized_data = discrete_data
             self._var_value_dict = var_value_dict
-            self._value_node_dict = value_node_dict
-            self._cont_vars = set(self._X.index[self._X[self.type_column].isin(['numerical', 'cont'])])
             self._cat_vars = set(self._X.index[self._X[self.type_column].isin(['nominal', 'cat', 'ordinal'])])
-        
+
         # Store actual dataframe without type column for potential imputation later.
+        self._cont_vars = set(self._X.index[self._X[self.type_column].isin(['numerical', 'cont'])])
         self._X.drop(columns=[self.type_column], inplace=True)
 
         # Compute node-based embeddings.
         node_embeddings, variable_embeddings, bin_embeddings, auc, ap = self.compute_node_embeddings(graph_data,
                                                                                      variable_embedding_ids,
                                                                                      cont_bin_embedding_ids)
+        self._graph_data = graph_data  # graph_data is on CPU after compute_node_embeddings
         self._auc = auc
         self._ap = ap
         self._all_embeddings = node_embeddings
@@ -221,6 +223,147 @@ class Embedder(BaseEstimator, ClassifierMixin):
 
         return imputed_df
 
+
+    def _remap_to_populated_bin(self, var, bin_id):
+        """Return the nearest bin index to bin_id that has a node in the training graph."""
+        for delta in range(1, self.bins_per_continuous):
+            for candidate in (bin_id - delta, bin_id + delta):
+                if 0 <= candidate < self.bins_per_continuous:
+                    if f"{var}={float(candidate)}" in self._value_node_dict:
+                        return candidate
+        return None
+
+    def _get_bin_id(self, variable, value):
+        """Map a single continuous value to its training-time bin ID."""
+        stats = self._bin_stats[variable]
+        if stats['type'] == 'z':
+            std = stats['std']
+            z = 0.0 if std == 0 else (value - stats['mean']) / std
+            result = pd.cut([z], bins=get_zscore_bins(self.bins_per_continuous), labels=False)
+            bin_val = result[0]
+            return None if pd.isna(bin_val) else int(bin_val)
+        elif stats['type'] == 'nonlinear':
+            return int(np.digitize(value, stats['edges'][1:-1], right=True))
+        return None
+
+    def transform(self, X):
+        """Generate embeddings for new, unseen samples using the frozen trained encoder.
+
+        Augments the training graph with the new sample nodes and their edges to existing
+        value nodes, then runs a single frozen forward pass to produce embeddings.
+
+        Args:
+            X (pd.DataFrame): New samples in the same format as the training data
+                              (rows=variables, columns=new_samples+type_column).
+
+        Returns:
+            pd.DataFrame: Embedding matrix with shape (num_new_samples, embedding_dimension),
+                          indexed by sample name.
+        """
+        if not hasattr(self, '_graph_data'):
+            raise ValueError("Run fit() first before calling transform()!")
+
+        input_data = X.copy()
+        new_samples = [c for c in input_data.columns if c != self.type_column]
+        input_data.drop(columns=[self.type_column], inplace=True)
+
+        new_vars = set(input_data.index)
+        train_vars = set(self._variable_names)
+        if new_vars != train_vars:
+            missing = sorted(train_vars - new_vars)
+            extra = sorted(new_vars - train_vars)
+            parts = []
+            if missing:
+                parts.append(f"missing from input: {missing}")
+            if extra:
+                parts.append(f"not seen during training: {extra}")
+            raise ValueError("Variable mismatch between transform input and training data — " + "; ".join(parts))
+
+        cat_vars = set(self._variable_names) - self._cont_vars
+        mismatched = {}
+        for var in cat_vars:
+            prefix = f"{var}="
+            training_cats = {label[len(prefix):] for label in self._value_node_dict if label.startswith(prefix)}
+            new_cats = {
+                f"{float(input_data.loc[var, s])}"
+                for s in new_samples
+                if not pd.isna(input_data.loc[var, s])
+                and float(input_data.loc[var, s]) != self.non_informative_na
+            }
+            unseen = new_cats - training_cats
+            if unseen:
+                mismatched[var] = sorted(unseen)
+        if mismatched:
+            raise ValueError(
+                "Categorical variables contain values not seen during training: "
+                + "; ".join(f"{var}: {vals}" for var, vals in sorted(mismatched.items()))
+            )
+
+        num_existing_nodes = self._graph_data.num_nodes
+        new_edges = [[], []]
+
+        for i, sample in enumerate(new_samples):
+            new_node_idx = num_existing_nodes + i
+            for var in input_data.index:
+                raw = input_data.loc[var, sample]
+                if pd.isna(raw):
+                    raise ValueError("Actual NA entry detected in input dataframe.")
+                value = float(raw)
+                if value == self.non_informative_na:
+                    continue
+
+                if var in self._cont_vars and value not in self.informative_nas:
+                    bin_id = self._get_bin_id(var, value)
+                    if bin_id is None:
+                        continue
+                    value_label = f"{var}={float(bin_id)}"
+                    if value_label not in self._value_node_dict:
+                        remapped = self._remap_to_populated_bin(var, bin_id)
+                        if remapped is None:
+                            continue
+                        value_label = f"{var}={float(remapped)}"
+                else:
+                    value_label = f"{var}={value}"
+                    if value_label not in self._value_node_dict:
+                        raise ValueError(f"Value label not seen on training data: {value_label}")
+
+                new_edges[0].append(new_node_idx)
+                new_edges[1].append(self._value_node_dict[value_label])
+
+        if not new_edges[0]:
+            raise ValueError("No valid edges could be constructed for the new samples. "
+                             "Check that the input variables match the training data.")
+
+        new_edges_tensor = torch.tensor(new_edges, dtype=torch.long)
+        reversed_edges = torch.stack([new_edges_tensor[1], new_edges_tensor[0]])
+
+        device = next(self.model.parameters()).device
+        training_edge_index = self._graph_data.edge_index.to(device)
+        augmented_edge_index = torch.cat(
+            [training_edge_index, new_edges_tensor.to(device), reversed_edges.to(device)], dim=1
+        )
+
+        num_new = len(new_samples)
+        self.model.eval()
+        with torch.no_grad():
+            c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
+            c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
+            training_embeds = c1 + c2
+
+            new_sample_embeds = torch.zeros(num_new, self.embedding_dimension, device=device)
+            augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
+
+            norms = augmented_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+            augmented_embeds = augmented_embeds / norms
+
+            latent = self.model.encoder(augmented_embeds, augmented_edge_index)
+            norms = latent.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+            latent = latent / norms
+
+            new_latent = latent[num_existing_nodes:].cpu()
+
+        embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
+        return pd.DataFrame(new_latent.numpy(), index=new_samples, columns=embedding_cols)
 
     def _move_self_tensors(self, device):
         """Move all tensor-like attributes of self to given device."""
@@ -349,6 +492,25 @@ class Embedder(BaseEstimator, ClassifierMixin):
         variable_types = data[dtype_col].to_list()
         data.drop(columns=[dtype_col], inplace=True)
 
+        # Compute per-variable bin stats for later inductive inference on new samples.
+        bin_stats = {}
+        for var in continuous_vars:
+            col = data.loc[var].copy().astype(float)
+            valid = ~((col == ignore_na) | col.isin(keep_na) | col.isna())
+            non_na = col[valid]
+            if self.discretization_type == "z":
+                if len(set(non_na)) == 1:
+                    bin_stats[var] = {'type': 'z', 'mean': float(non_na.iloc[0]), 'std': 1.0}
+                else:
+                    bin_stats[var] = {'type': 'z', 'mean': float(non_na.mean()), 'std': float(non_na.std(ddof=0))}
+            elif self.discretization_type == "nonlinear":
+                if len(set(non_na)) == 1:
+                    val = float(non_na.iloc[0])
+                    bin_stats[var] = {'type': 'nonlinear', 'edges': np.array([-np.inf, val, np.inf])}
+                else:
+                    edges, _ = signed_power_bins(non_na.values, n_bins=self.bins_per_continuous)
+                    bin_stats[var] = {'type': 'nonlinear', 'edges': edges}
+
         if self.discretization_type == "z":
             data.loc[continuous_vars] = data.loc[continuous_vars].apply(
                 lambda row: bin_column_with_na_adjusted(row, self.bins_per_continuous, ignore_na, keep_na), axis=1)
@@ -452,6 +614,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
             neg_edges_per_pair[(sample, var, pos_value)] = (torch.tensor(negative_edges, dtype=torch.long, device=self.device))
 
         data.drop(columns=[dtype_col], inplace=True)
-        return (data, graph_data, num_variables, sample_node_ids, value_node_ids, 
+        return (data, graph_data, num_variables, sample_node_ids, value_node_ids,
                 var_value_dict, neg_edges_per_pair, variable_names, variable_embedding_ids,
-                cont_bin_names, cont_bin_embedding_ids)
+                cont_bin_names, cont_bin_embedding_ids, bin_stats)
