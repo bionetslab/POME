@@ -211,10 +211,12 @@ def test_transform_unseen_category():
     embedder, held_out = _fit_embedder(epochs=10)
 
     # Inject a categorical value never seen during training (valid cats are 0–3).
+    # The unseen value is treated as missing: no edge is added for it, but
+    # transform() succeeds using the remaining observed features.
     new_df = example_df[[held_out, "type"]].copy()
     new_df.loc["cat", held_out] = 99.0
-    with pytest.raises(ValueError, match="not seen during training"):
-        embedder.transform(new_df)
+    result = embedder.transform(new_df)
+    assert result.shape == (1, embedder.embedding_dimension)
 
 def test_transform_empty_bin_remapping():
     embedder, held_out = _fit_embedder(epochs=10)

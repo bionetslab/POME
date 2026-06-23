@@ -10,7 +10,7 @@ from torch_geometric.seed import seed_everything
 from sklearn.base import BaseEstimator, ClassifierMixin
 import joblib
 from pome.models import GraphAutoencoder
-from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
+from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins, HEOM_NORM
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
@@ -246,15 +246,92 @@ class Embedder(BaseEstimator, ClassifierMixin):
             return int(np.digitize(value, stats['edges'][1:-1], right=True))
         return None
 
-    def transform(self, X):
+    def _knn_init_embeddings(self, input_data, new_samples, training_embeds, k, tau):
+        """Initialize unseen-sample embeddings from their nearest training samples.
+
+        For each unseen sample the HEOM distance to every training sample is computed on
+        the raw input data, and the new sample's initial node embedding is set to a
+        softmax-distance-weighted mean of the ``k`` nearest training samples' initial
+        node embeddings (``w_i = exp(-d_i / tau)``, normalized). The HEOM numerical
+        normalization range is fit over the training and new samples combined.
+
+        Args:
+            input_data (pd.DataFrame): New samples, rows=variables, columns=new_samples
+                                       (type column already dropped).
+            new_samples (list[str]): Column names of the unseen samples.
+            training_embeds (torch.Tensor): Initial (pre-encoder) node embeddings of the
+                                            training graph, shape (num_existing_nodes, dim).
+            k (int): Number of nearest training neighbors to average.
+            tau (float): Softmax temperature controlling the distance-weighting sharpness.
+
+        Returns:
+            torch.Tensor: Initial embeddings for the new sample nodes, shape (num_new, dim),
+                          on the same device as ``training_embeds``.
+        """
+        # Align variable order between training data and new input so columns line up
+        # consistently with the categorical-index list passed to HEOM.
+        var_order = list(self._X.index)
+        train_df = self._X.loc[var_order]
+        new_df = input_data.loc[var_order, new_samples]
+
+        # HEOM expects samples as rows and variables as columns.
+        train_mat = train_df.to_numpy(dtype=float).T
+        new_mat = new_df.to_numpy(dtype=float).T
+
+        # Treat the non-informative NA sentinel as missing so it is excluded from both the
+        # HEOM normalization range and the per-pair distance computation.
+        train_mat[train_mat == self.non_informative_na] = np.nan
+        new_mat[new_mat == self.non_informative_na] = np.nan
+
+        # Categorical variables use the overlap metric; everything else is numerical.
+        cat_ix = [i for i, var in enumerate(var_order) if var not in self._cont_vars]
+
+        # Fit the HEOM numerical normalization range over training and new samples combined.
+        heom = HEOM_NORM(np.vstack([train_mat, new_mat]), cat_ix, nan_equivalents=[np.nan])
+
+        # Training sample node indices aligned to train_mat rows (= self._X column order).
+        train_sample_idx = [self._sample_node_dict[s] for s in train_df.columns]
+        train_init = training_embeds[train_sample_idx]
+
+        k_eff = min(k, train_mat.shape[0])
+        new_embeds = torch.zeros(len(new_samples), self.embedding_dimension,
+                                 device=training_embeds.device, dtype=training_embeds.dtype)
+
+        for i in range(new_mat.shape[0]):
+            dists = np.array([heom.heom_metric(new_mat[i], train_mat[j])
+                              for j in range(train_mat.shape[0])])
+            # Guard against degenerate (e.g. zero-range numerical column) distances.
+            dists = np.nan_to_num(dists, nan=1e12, posinf=1e12)
+
+            nn_idx = np.argsort(dists)[:k_eff]
+            nn_dists = dists[nn_idx]
+
+            # Softmax over negative distances (max-shifted for numerical stability).
+            logits = -nn_dists / tau
+            logits = logits - logits.max()
+            weights = np.exp(logits)
+            weights = weights / weights.sum()
+
+            w = torch.tensor(weights, dtype=train_init.dtype, device=train_init.device)
+            new_embeds[i] = (w.unsqueeze(1) * train_init[nn_idx]).sum(dim=0)
+
+        return new_embeds
+
+    def transform(self, X, k=5, tau=1.0):
         """Generate embeddings for new, unseen samples using the frozen trained encoder.
 
         Augments the training graph with the new sample nodes and their edges to existing
-        value nodes, then runs a single frozen forward pass to produce embeddings.
+        value nodes, then runs a single frozen forward pass to produce embeddings. Each new
+        sample node is initialized from a softmax-distance-weighted mean of its ``k`` nearest
+        training samples' initial embeddings (HEOM distance on the raw data) before the pass.
 
         Args:
             X (pd.DataFrame): New samples in the same format as the training data
                               (rows=variables, columns=new_samples+type_column).
+            k (int): Number of nearest training samples used to initialize each new sample
+                     node embedding. Defaults to 5.
+            tau (float): Softmax temperature for the distance weighting; smaller values give
+                         more weight to the closest neighbors. Defaults to 1.0.
 
         Returns:
             pd.DataFrame: Embedding matrix with shape (num_new_samples, embedding_dimension),
@@ -278,26 +355,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
             if extra:
                 parts.append(f"not seen during training: {extra}")
             raise ValueError("Variable mismatch between transform input and training data — " + "; ".join(parts))
-
-        cat_vars = set(self._variable_names) - self._cont_vars
-        mismatched = {}
-        for var in cat_vars:
-            prefix = f"{var}="
-            training_cats = {label[len(prefix):] for label in self._value_node_dict if label.startswith(prefix)}
-            new_cats = {
-                f"{float(input_data.loc[var, s])}"
-                for s in new_samples
-                if not pd.isna(input_data.loc[var, s])
-                and float(input_data.loc[var, s]) != self.non_informative_na
-            }
-            unseen = new_cats - training_cats
-            if unseen:
-                mismatched[var] = sorted(unseen)
-        if mismatched:
-            raise ValueError(
-                "Categorical variables contain values not seen during training: "
-                + "; ".join(f"{var}: {vals}" for var, vals in sorted(mismatched.items()))
-            )
 
         num_existing_nodes = self._graph_data.num_nodes
         new_edges = [[], []]
@@ -325,7 +382,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 else:
                     value_label = f"{var}={value}"
                     if value_label not in self._value_node_dict:
-                        raise ValueError(f"Value label not seen on training data: {value_label}")
+                        continue
 
                 new_edges[0].append(new_node_idx)
                 new_edges[1].append(self._value_node_dict[value_label])
@@ -343,14 +400,13 @@ class Embedder(BaseEstimator, ClassifierMixin):
             [training_edge_index, new_edges_tensor.to(device), reversed_edges.to(device)], dim=1
         )
 
-        num_new = len(new_samples)
         self.model.eval()
         with torch.no_grad():
             c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
             c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
             training_embeds = c1 + c2
 
-            new_sample_embeds = torch.zeros(num_new, self.embedding_dimension, device=device)
+            new_sample_embeds = self._knn_init_embeddings(input_data, new_samples, training_embeds, k, tau)
             augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
 
             norms = augmented_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
