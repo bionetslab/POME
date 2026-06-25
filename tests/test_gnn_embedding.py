@@ -280,6 +280,17 @@ def test_transform_all_na_input():
     with pytest.raises(ValueError, match="No valid edges"):
         embedder.transform(new_df)
 
+def test_transform_one_edgeless_sample_raises():
+    # Even a single edgeless sample (all values missing) among otherwise valid samples
+    # must raise: it carries no signal for the encoder.
+    TYPE_COL = "type"
+    sample_cols = [c for c in example_df.columns if c != TYPE_COL]
+    embedder, _ = _fit_embedder(epochs=10)
+    new_df = example_df[sample_cols[:2] + [TYPE_COL]].copy()
+    new_df.loc[:, sample_cols[0]] = NA_ENCODING  # first sample edgeless, second valid
+    with pytest.raises(ValueError, match="No valid edges"):
+        embedder.transform(new_df)
+
 def test_constant_continuous_variable_z():
     # A continuous variable with a single unique value triggers the zscore constant-var
     # fallback in both data_to_graph (line 503) and bin_column_with_na_adjusted (utils 62-63).

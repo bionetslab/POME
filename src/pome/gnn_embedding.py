@@ -10,7 +10,7 @@ from torch_geometric.seed import seed_everything
 from sklearn.base import BaseEstimator, ClassifierMixin
 import joblib
 from pome.models import GraphAutoencoder
-from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins, HEOM_NORM
+from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
@@ -246,92 +246,111 @@ class Embedder(BaseEstimator, ClassifierMixin):
             return int(np.digitize(value, stats['edges'][1:-1], right=True))
         return None
 
-    def _knn_init_embeddings(self, input_data, new_samples, training_embeds, k, tau):
-        """Initialize unseen-sample embeddings from their nearest training samples.
+    def _sample_value_node_pairs(self, input_data, sample):
+        """Map one new sample to the training value nodes it connects to.
 
-        For each unseen sample the HEOM distance to every training sample is computed on
-        the raw input data, and the new sample's initial node embedding is set to a
-        softmax-distance-weighted mean of the ``k`` nearest training samples' initial
-        node embeddings (``w_i = exp(-d_i / tau)``, normalized). The HEOM numerical
-        normalization range is fit over the training and new samples combined.
-
-        Args:
-            input_data (pd.DataFrame): New samples, rows=variables, columns=new_samples
-                                       (type column already dropped).
-            new_samples (list[str]): Column names of the unseen samples.
-            training_embeds (torch.Tensor): Initial (pre-encoder) node embeddings of the
-                                            training graph, shape (num_existing_nodes, dim).
-            k (int): Number of nearest training neighbors to average.
-            tau (float): Softmax temperature controlling the distance-weighting sharpness.
+        Reproduces the edge-construction logic used during fit(): continuous values
+        are mapped to their training-time bin (with empty-bin remapping), NA sentinels
+        are skipped, and unseen categories are dropped.
 
         Returns:
-            torch.Tensor: Initial embeddings for the new sample nodes, shape (num_new, dim),
-                          on the same device as ``training_embeds``.
+            list[tuple[str, int]]: (variable, value_node_index) pairs for each observed,
+                                   in-vocabulary value of the sample.
         """
-        # Align variable order between training data and new input so columns line up
-        # consistently with the categorical-index list passed to HEOM.
-        var_order = list(self._X.index)
-        train_df = self._X.loc[var_order]
-        new_df = input_data.loc[var_order, new_samples]
+        pairs = []
+        for var in input_data.index:
+            raw = input_data.loc[var, sample]
+            if pd.isna(raw):
+                raise ValueError("Actual NA entry detected in input dataframe.")
+            value = float(raw)
+            if value == self.non_informative_na:
+                continue
 
-        # HEOM expects samples as rows and variables as columns.
-        train_mat = train_df.to_numpy(dtype=float).T
-        new_mat = new_df.to_numpy(dtype=float).T
+            if var in self._cont_vars and value not in self.informative_nas:
+                bin_id = self._get_bin_id(var, value)
+                if bin_id is None:
+                    continue
+                value_label = f"{var}={float(bin_id)}"
+                if value_label not in self._value_node_dict:
+                    remapped = self._remap_to_populated_bin(var, bin_id)
+                    if remapped is None:
+                        continue
+                    value_label = f"{var}={float(remapped)}"
+            else:
+                value_label = f"{var}={value}"
+                if value_label not in self._value_node_dict:
+                    continue
 
-        # Treat the non-informative NA sentinel as missing so it is excluded from both the
-        # HEOM normalization range and the per-pair distance computation.
-        train_mat[train_mat == self.non_informative_na] = np.nan
-        new_mat[new_mat == self.non_informative_na] = np.nan
+            pairs.append((var, self._value_node_dict[value_label]))
+        return pairs
 
-        # Categorical variables use the overlap metric; everything else is numerical.
-        cat_ix = [i for i, var in enumerate(var_order) if var not in self._cont_vars]
+    def _augmented_edge_index(self, pairs_per_sample, base_idx, device):
+        """Build the augmented edge_index that injects new sample nodes into the training graph.
 
-        # Fit the HEOM numerical normalization range over training and new samples combined.
-        heom = HEOM_NORM(np.vstack([train_mat, new_mat]), cat_ix, nan_equivalents=[np.nan])
+        Only ``value_node -> new_node`` edges are added: each new sample *receives* messages
+        from the frozen value nodes but never sends any back. This keeps the shared value-node
+        representations identical to training and lets every new sample be encoded in a single
+        pass without perturbing the training nodes or interfering with each other.
 
-        # Training sample node indices aligned to train_mat rows (= self._X column order).
-        train_sample_idx = [self._sample_node_dict[s] for s in train_df.columns]
-        train_init = training_embeds[train_sample_idx]
+        Args:
+            pairs_per_sample (list[list[tuple[str, int]]]): per-new-sample (var, value_node) pairs.
+            base_idx (int): node index assigned to the first new sample (subsequent samples
+                            are base_idx+1, base_idx+2, ...).
+            device: torch device.
 
-        k_eff = min(k, train_mat.shape[0])
-        new_embeds = torch.zeros(len(new_samples), self.embedding_dimension,
-                                 device=training_embeds.device, dtype=training_embeds.dtype)
+        Returns:
+            torch.Tensor | None: augmented edge_index, or None if no new edges could be built.
+        """
+        value_src, new_dst = [], []
+        for offset, pairs in enumerate(pairs_per_sample):
+            node = base_idx + offset
+            for _, value_node in pairs:
+                # PyG convention: a message flows src -> dst, so value_node -> new_node lets
+                # the new sample aggregate from its value nodes (and never the reverse).
+                value_src.append(value_node)
+                new_dst.append(node)
+        if not value_src:
+            return None
+        recv_edges = torch.tensor([value_src, new_dst], dtype=torch.long, device=device)
+        training_edge_index = self._graph_data.edge_index.to(device)
+        return torch.cat([training_edge_index, recv_edges], dim=1)
 
-        for i in range(new_mat.shape[0]):
-            dists = np.array([heom.heom_metric(new_mat[i], train_mat[j])
-                              for j in range(train_mat.shape[0])])
-            # Guard against degenerate (e.g. zero-range numerical column) distances.
-            dists = np.nan_to_num(dists, nan=1e12, posinf=1e12)
+    def _frozen_encode(self, augmented_embeds, augmented_edge_index):
+        """Normalize node inputs, run the frozen encoder, and L2-normalize the latents.
 
-            nn_idx = np.argsort(dists)[:k_eff]
-            nn_dists = dists[nn_idx]
+        Mirrors GraphAutoencoder.get_embeddings exactly so training (transductive) and
+        inductive nodes are processed identically.
+        """
+        norms = augmented_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+        augmented_embeds = augmented_embeds / norms
+        latent = self.model.encoder(augmented_embeds, augmented_edge_index)
+        norms = latent.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+        return latent / norms
 
-            # Softmax over negative distances (max-shifted for numerical stability).
-            logits = -nn_dists / tau
-            logits = logits - logits.max()
-            weights = np.exp(logits)
-            weights = weights / weights.sum()
-
-            w = torch.tensor(weights, dtype=train_init.dtype, device=train_init.device)
-            new_embeds[i] = (w.unsqueeze(1) * train_init[nn_idx]).sum(dim=0)
-
-        return new_embeds
-
-    def transform(self, X, k=5, tau=1.0):
+    def transform(self, X):
         """Generate embeddings for new, unseen samples using the frozen trained encoder.
 
-        Augments the training graph with the new sample nodes and their edges to existing
-        value nodes, then runs a single frozen forward pass to produce embeddings. Each new
-        sample node is initialized from a softmax-distance-weighted mean of its ``k`` nearest
-        training samples' initial embeddings (HEOM distance on the raw data) before the pass.
+        The trained model weights are never updated (no retraining). Each new sample is added
+        to the training graph as a node connected to the training value nodes it observes, with
+        edges pointing *only* from value nodes to the new sample. Because the new samples never
+        send messages back, the shared value-node representations stay identical to training
+        and all new samples are encoded in a single forward pass without affecting the training
+        nodes or one another. The new node's own ("self-loop") input embedding is set to zeros:
+        the trained encoder assigns negligible weight to a sample node's self-loop, so the
+        embedding is determined by which value nodes the sample connects to (its data), and a
+        data-derived initialization was found to have no measurable effect.
+
+        Empirically this places inductive embeddings in the same distribution as the
+        transductive training embeddings (Rosenbaum cross-match z ~ 0). Adding the new samples
+        with bidirectional edges instead perturbs the value nodes and is markedly
+        out-of-distribution.
+
+        Every sample must share at least one observed, in-vocabulary value with the training
+        data; an edgeless sample (all values missing / unseen) has no signal and raises.
 
         Args:
             X (pd.DataFrame): New samples in the same format as the training data
                               (rows=variables, columns=new_samples+type_column).
-            k (int): Number of nearest training samples used to initialize each new sample
-                     node embedding. Defaults to 5.
-            tau (float): Softmax temperature for the distance weighting; smaller values give
-                         more weight to the closest neighbors. Defaults to 1.0.
 
         Returns:
             pd.DataFrame: Embedding matrix with shape (num_new_samples, embedding_dimension),
@@ -356,66 +375,35 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 parts.append(f"not seen during training: {extra}")
             raise ValueError("Variable mismatch between transform input and training data — " + "; ".join(parts))
 
+        # Resolve which training value nodes each new sample connects to. Every sample must
+        # have at least one valid edge, otherwise it carries no signal for the encoder.
+        pairs_per_sample = [self._sample_value_node_pairs(input_data, s) for s in new_samples]
+        edgeless = [s for s, pairs in zip(new_samples, pairs_per_sample) if not pairs]
+        if edgeless:
+            raise ValueError(
+                f"No valid edges for sample(s) {edgeless}: none of their values are observed, "
+                "in-vocabulary values shared with the training data, so they have no signal. "
+                "Every sample must share at least one value with the training data.")
+
         num_existing_nodes = self._graph_data.num_nodes
-        new_edges = [[], []]
-
-        for i, sample in enumerate(new_samples):
-            new_node_idx = num_existing_nodes + i
-            for var in input_data.index:
-                raw = input_data.loc[var, sample]
-                if pd.isna(raw):
-                    raise ValueError("Actual NA entry detected in input dataframe.")
-                value = float(raw)
-                if value == self.non_informative_na:
-                    continue
-
-                if var in self._cont_vars and value not in self.informative_nas:
-                    bin_id = self._get_bin_id(var, value)
-                    if bin_id is None:
-                        continue
-                    value_label = f"{var}={float(bin_id)}"
-                    if value_label not in self._value_node_dict:
-                        remapped = self._remap_to_populated_bin(var, bin_id)
-                        if remapped is None:
-                            continue
-                        value_label = f"{var}={float(remapped)}"
-                else:
-                    value_label = f"{var}={value}"
-                    if value_label not in self._value_node_dict:
-                        continue
-
-                new_edges[0].append(new_node_idx)
-                new_edges[1].append(self._value_node_dict[value_label])
-
-        if not new_edges[0]:
-            raise ValueError("No valid edges could be constructed for the new samples. "
-                             "Check that the input variables match the training data.")
-
-        new_edges_tensor = torch.tensor(new_edges, dtype=torch.long)
-        reversed_edges = torch.stack([new_edges_tensor[1], new_edges_tensor[0]])
-
         device = next(self.model.parameters()).device
-        training_edge_index = self._graph_data.edge_index.to(device)
-        augmented_edge_index = torch.cat(
-            [training_edge_index, new_edges_tensor.to(device), reversed_edges.to(device)], dim=1
-        )
-
         self.model.eval()
+
         with torch.no_grad():
+            # Frozen training-node input embeddings (component_1 + component_2). New sample
+            # nodes get a zero self-loop feature (the encoder ignores it; the embedding comes
+            # entirely from the value nodes the sample connects to).
             c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
             c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
             training_embeds = c1 + c2
 
-            new_sample_embeds = self._knn_init_embeddings(input_data, new_samples, training_embeds, k, tau)
+            new_sample_embeds = torch.zeros(
+                len(new_samples), self.embedding_dimension,
+                device=device, dtype=training_embeds.dtype)
             augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
-
-            norms = augmented_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
-            augmented_embeds = augmented_embeds / norms
-
-            latent = self.model.encoder(augmented_embeds, augmented_edge_index)
-            norms = latent.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
-            latent = latent / norms
-
+            augmented_edge_index = self._augmented_edge_index(
+                pairs_per_sample, num_existing_nodes, device)
+            latent = self._frozen_encode(augmented_embeds, augmented_edge_index)
             new_latent = latent[num_existing_nodes:].cpu()
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]

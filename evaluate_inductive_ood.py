@@ -99,7 +99,10 @@ def run_xmatch(emb_a: pd.DataFrame, label_a: str,
 
 
 def evaluate_split(split_id: int, epochs: int, device: str) -> list[dict]:
-    """Fit on one split and run the MAIN and CONTROL cross-match tests."""
+    """Fit on one split and run the MAIN and CONTROL cross-match tests.
+
+    Embeddings for unseen samples use the (directed) inductive transform().
+    """
     tag = f"split_{split_id:02d}"
     train_path = SPLITS_DIR / f"{tag}_train_graph.tsv"
     test_path = SPLITS_DIR / f"{tag}_test_graph.tsv"
@@ -153,12 +156,14 @@ def evaluate_split(split_id: int, epochs: int, device: str) -> list[dict]:
 
 def summarize(df: pd.DataFrame) -> None:
     print("\n=== Summary (mean +/- std across splits) ===")
+    print("  Higher p-value / less-negative z = more in-distribution (better).")
     for comparison, sub in df.groupby("comparison"):
+        n_sig = int((sub["p_value"] < 0.05).sum())
         print(
             f"  {comparison:8s}  "
             f"p_value = {sub['p_value'].mean():.4g} +/- {sub['p_value'].std():.4g}   "
             f"z_score = {sub['z_score'].mean():.3f} +/- {sub['z_score'].std():.3f}   "
-            f"coverage = {sub['coverage'].mean():.2%}"
+            f"sig(p<0.05) {n_sig}/{len(sub)}"
         )
     main = df[df["comparison"] == "main"]
     n_sig = int((main["p_value"] < 0.05).sum())
@@ -167,8 +172,8 @@ def summarize(df: pd.DataFrame) -> None:
         f"in {n_sig}/{len(main)} splits."
     )
     print(
-        "  If the CONTROL is similarly significant, MAIN separation is largely "
-        "a method artifact (inductive vs transductive), not genuine data OOD."
+        "  If the CONTROL is not significant, the inductive transform introduces no "
+        "method artifact, so any MAIN separation reflects genuine data OOD."
     )
 
 
@@ -193,7 +198,7 @@ def make_plot(df: pd.DataFrame) -> None:
     ax.set_xticklabels([f"{s:02d}" for s in splits])
     ax.set_xlabel("split")
     ax.set_ylabel("cross-match p-value")
-    ax.set_title("POME inductive-embedding OOD test (scxmatch, sqeuclidean)")
+    ax.set_title("POME inductive-embedding OOD test (directed, scxmatch sqeuclidean)")
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(SUMMARY_PNG, dpi=150)
@@ -221,7 +226,10 @@ def main() -> None:
     print(f"\nWrote per-split results to {RESULTS_CSV}")
 
     summarize(df)
-    make_plot(df)
+    try:
+        make_plot(df)
+    except Exception as exc:  # plotting is non-essential
+        print(f"(plot skipped: {exc})")
 
 
 if __name__ == "__main__":
