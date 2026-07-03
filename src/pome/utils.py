@@ -5,9 +5,7 @@ from scipy.stats import zscore
 import numpy as np
 
 def link_similarity(embeddings, edge_index, decoder_model=None):
-    u, v = edge_index  # Extract node pairs
-    similarities = decoder_model(embeddings, edge_index)
-    return similarities
+    return decoder_model(embeddings, edge_index)
 
 
 def compute_roc(graph_data, neg_edges_per_pair, node_embeddings, decoder_model):
@@ -32,6 +30,19 @@ def compute_roc(graph_data, neg_edges_per_pair, node_embeddings, decoder_model):
 
     return roc_auc, avg_precision
 
+def get_zscore_bins(K):
+    if K == 15:
+        return [-np.inf, -3.5, -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, np.inf]
+    elif K == 11:
+        return [-np.inf, -3.5, -2.5, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.5, 3.5, np.inf]
+    elif K == 7:
+        return [-np.inf, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, np.inf]
+    elif K == 3:
+        return [-np.inf, -0.5, 0.5, np.inf]
+    else:
+        raise ValueError(f"Invalid number of z-score bins: {K}")
+
+
 def bin_column_with_na_adjusted(column, K, true_missing, keep_nas):
     column = column.copy()  # Avoid modifying the original data
     column = column.astype(float)
@@ -47,21 +58,12 @@ def bin_column_with_na_adjusted(column, K, true_missing, keep_nas):
     # Compute z-scores of non-NA values.
     if len(set(non_na))==1:
         print(f"Warning: cont variable {column.name} contains only one unique value. Setting zscore to 0.")
-        non_na_zscores = [0.0] * len(non_na)
+        non_na_zscores = np.zeros(len(non_na))
     else:
         non_na_zscores = zscore(non_na, nan_policy='raise')
     
     # Perform binning on valid values
-    if K==15:
-        zscore_bins = [-np.inf, -3.5, -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, np.inf]
-    elif K==11:
-        zscore_bins = [-np.inf, -3.5, -2.5, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.5, 3.5, np.inf]
-    elif K==7:
-        zscore_bins = [-np.inf, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, np.inf]
-    elif K==3:
-        zscore_bins = [-np.inf, -0.5, 0.5, np.inf]
-    else:
-        raise ValueError(f"Invalid number of z-score bins: {K}")
+    zscore_bins = get_zscore_bins(K)
     
     binned_non_na = pd.cut(non_na_zscores, bins=zscore_bins, labels=False)
 
@@ -114,7 +116,7 @@ def bin_column_non_linear(column, K, true_missing, keep_nas):
     # Compute non-linear bins of non-NA values.
     if len(set(non_na))==1:
         print(f"Warning: cont variable {column.name} contains only one unique value. Setting all bins to 0.")
-        binned_non_na = [int((K-1)/2)] * len(non_na)
+        binned_non_na = np.full(len(non_na), int((K-1)/2))
     else:
         _, binned_non_na = signed_power_bins(non_na, n_bins=K)
 

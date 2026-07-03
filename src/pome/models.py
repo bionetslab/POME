@@ -1,4 +1,4 @@
-from torch_geometric.nn import GATConv, GCNConv, SAGEConv
+from torch_geometric.nn import GATConv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +13,7 @@ class GraphEncoder(torch.nn.Module):
         if layer_type == "GAT":
             Layer = GATConv
         else:
-            raise ValueError(f"Unknown layer_type: {layer_type}. Choose from ['GCN', 'GAT', 'SAGE']")
+            raise ValueError(f"Unknown layer_type: {layer_type}. Choose from ['GAT']")
 
         self.convs = torch.nn.ModuleList()
 
