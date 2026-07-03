@@ -49,7 +49,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.device = device
         self.lr = lr
         self.layer_type = layer_type
-        self.num_nodes = None
         self.model = None
         self.type_column = type_column
         self.non_informative_na = na_encoding
