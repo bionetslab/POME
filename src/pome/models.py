@@ -52,6 +52,27 @@ class MLPDecoder(torch.nn.Module):
         x = self.layer2(x)
         return torch.sigmoid(x).squeeze()
 
+class ValueRegressor(torch.nn.Module):
+    """Predicts a (standardized) continuous value from a sample and a variable embedding.
+
+    Used for regression-based numeric imputation: the concatenation of a sample's latent
+    embedding and the target variable's embedding is mapped to a single scalar. Trained
+    after GNN training on frozen embeddings, so it lives outside GraphAutoencoder and is
+    pickled independently (like the fitted decoder).
+    """
+    def __init__(self, embedding_dim, hidden_dim=None):
+        super().__init__()
+        hidden = hidden_dim or embedding_dim
+        self.net = nn.Sequential(
+            nn.Linear(embedding_dim * 2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, sample_emb, var_emb):
+        # sample_emb, var_emb: [N, embedding_dim] -> [N]
+        return self.net(torch.cat([sample_emb, var_emb], dim=1)).squeeze(-1)
+
 # Graph Autoencoder
 class GraphAutoencoder(nn.Module):
     def __init__(self, num_embeddings, embedding_dim, encoder_layer, node_to_embeddings_index,

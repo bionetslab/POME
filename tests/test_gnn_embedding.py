@@ -4,6 +4,7 @@ import torch
 import os
 import numpy as np
 import pytest
+import joblib
 
 example_df = pd.read_csv("example.csv", index_col=0)
 NA_ENCODING = -99.0
@@ -11,6 +12,8 @@ DIMENSION = 16
 DEVICE = "cpu"
 NUM_SAMPLES = len(example_df.columns)-1
 NUM_VARS = len(example_df)
+CONT_VARS = [v for v in example_df.index if example_df.loc[v, "type"] in ("numerical", "cont")]
+SAMPLE_COLS = [c for c in example_df.columns if c != "type"]
 
 def test_embedder_init():
     
@@ -332,6 +335,108 @@ def test_informative_na_z():
                         discretization_type="z")
     embedder.fit(inf_df)
     assert embedder._ap >= 0
+
+def _regression_embedder(discretization_type="z", epochs=50):
+    return Embedder(epochs=epochs,
+                    na_encoding=NA_ENCODING,
+                    embedding_dimension=DIMENSION,
+                    device=DEVICE,
+                    enable_imputation=True,
+                    numeric_imputation="regression",
+                    discretization_type=discretization_type)
+
+def test_regression_imputation_z():
+    embedder = _regression_embedder("z")
+    embedder.fit(example_df)
+    imputed_df = embedder.impute_all(na_value=NA_ENCODING)
+
+    assert imputed_df.shape == (NUM_VARS, NUM_SAMPLES)
+    assert (imputed_df == NA_ENCODING).sum().sum() == 0
+    assert isinstance(embedder._value_regressor, torch.nn.Module)
+
+def test_regression_imputation_nonlinear():
+    embedder = _regression_embedder("nonlinear")
+    embedder.fit(example_df)
+    imputed_df = embedder.impute_all(na_value=NA_ENCODING)
+
+    assert (imputed_df == NA_ENCODING).sum().sum() == 0
+    # Every continuous variable observed in training gets standardization stats.
+    assert all(v in embedder._reg_target_stats for v in CONT_VARS)
+
+def test_regression_default_unchanged():
+    embedder = Embedder(epochs=50,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE,
+                        enable_imputation=True)
+    assert embedder.numeric_imputation == "bin_mean"
+    embedder.fit(example_df)
+    assert not hasattr(embedder, "_value_regressor")
+    imputed_df = embedder.impute_all(na_value=NA_ENCODING)
+    assert (imputed_df == NA_ENCODING).sum().sum() == 0
+
+def test_regression_differs_from_bin_mean():
+    make_deterministic(42)
+    bm = Embedder(epochs=50, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                  device=DEVICE, enable_imputation=True, numeric_imputation="bin_mean")
+    bm.fit(example_df)
+    bm_imp = bm.impute_all(na_value=NA_ENCODING)
+
+    make_deterministic(42)
+    rg = _regression_embedder("z")
+    rg.fit(example_df)
+    rg_imp = rg.impute_all(na_value=NA_ENCODING)
+
+    # Compare only continuous cells that were missing in the source and thus imputed.
+    missing = (example_df.loc[CONT_VARS, SAMPLE_COLS] == NA_ENCODING)
+    assert missing.values.any()
+    bm_vals = bm_imp.loc[CONT_VARS, SAMPLE_COLS].where(missing)
+    rg_vals = rg_imp.loc[CONT_VARS, SAMPLE_COLS].where(missing)
+    # Regression should not merely reproduce the per-bin means.
+    assert not np.allclose(bm_vals.fillna(0.0).values, rg_vals.fillna(0.0).values)
+
+def test_regression_output_finite():
+    embedder = _regression_embedder("z")
+    embedder.fit(example_df)
+    imputed_df = embedder.impute_all(na_value=NA_ENCODING)
+    cont_cells = imputed_df.loc[CONT_VARS, SAMPLE_COLS].to_numpy(dtype=float)
+    assert np.isfinite(cont_cells).all()
+
+def test_regression_without_imputation():
+    embedder = Embedder(epochs=50,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE,
+                        enable_imputation=False,
+                        numeric_imputation="regression")
+    embedder.fit(example_df)
+    assert not hasattr(embedder, "_value_regressor")
+    with pytest.raises(ValueError):
+        embedder.impute_all(na_value=NA_ENCODING)
+
+def test_regression_invalid_mode():
+    embedder = Embedder(epochs=10,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE,
+                        enable_imputation=True,
+                        numeric_imputation="rubbish")
+    with pytest.raises(ValueError):
+        embedder.fit(example_df)
+
+def test_regressor_persistence(tmp_path):
+    make_deterministic(42)
+    embedder = _regression_embedder("z")
+    embedder.fit(example_df)
+    before = embedder.impute_all(na_value=NA_ENCODING)
+
+    path = tmp_path / "reg_embedder.joblib"
+    joblib.dump(embedder, path)
+    reloaded = joblib.load(path)
+    after = reloaded.impute_all(na_value=NA_ENCODING)
+
+    assert isinstance(reloaded._value_regressor, torch.nn.Module)
+    pd.testing.assert_frame_equal(before, after)
 
 def test_informative_na_nonlinear():
     # Same with nonlinear discretization covers utils line 133.
