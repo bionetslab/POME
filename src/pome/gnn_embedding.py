@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 from torch_geometric.seed import seed_everything
 from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
 import joblib
 from pome.models import GraphAutoencoder
 from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
@@ -42,6 +44,11 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  discretization_type : str = "z",
                  enable_imputation : bool = False,
                  epoch_checkpoints : int = -1,
+                 inductive : bool = False,
+                 cv_folds : int = 3,
+                 cv_eval_every : int = 10,
+                 cv_patience : int = 3,
+                 cv_seed : int = 42,
                  ):
         self.embedding_dimension=embedding_dimension
         self.bins_per_continuous=bins_per_continuous
@@ -58,6 +65,14 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.discretization_type = discretization_type
         self.enable_imputation = enable_imputation
         self.save_epochs = epoch_checkpoints
+        # Inductive epoch tuning: when enabled, fit() first runs a sample-holdout CV to pick the
+        # number of epochs that best generalizes to unseen samples (avoids overfitting the graph),
+        # then trains on all samples for that many epochs.
+        self.inductive = inductive
+        self.cv_folds = cv_folds
+        self.cv_eval_every = cv_eval_every
+        self.cv_patience = cv_patience
+        self.cv_seed = cv_seed
 
     def fit(self, X, y=None):
         """Sklearn-based fit method for given tabular df.
@@ -71,6 +86,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """
         # Translate input data into graph based format.
         input_data = X.copy()
+
+        # For inductive use, first tune the number of training epochs via sample-holdout CV so the
+        # model generalizes to unseen samples instead of overfitting the graph. The global torch RNG
+        # is saved/restored around the CV so the subsequent full-data training is bit-identical to a
+        # fixed-epoch fit (only the epoch count changes).
+        cap = self.epochs
+        if self.inductive:
+            rng_state = torch.get_rng_state()
+            try:
+                self._optimal_epochs = self._tune_epochs_via_cv(input_data)
+            finally:
+                torch.set_rng_state(rng_state)
+            self._max_epochs = cap
+            self.epochs = self._optimal_epochs
+
         discrete_data, graph_data, _, sample_node_dict, value_node_dict, var_value_dict, neg_edges_per_pair, variable_names, variable_embedding_ids, cont_bin_names, cont_bin_embedding_ids, bin_stats = self.data_to_graph(
                           input_data,
                           dtype_col=self.type_column,
@@ -106,7 +136,11 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self._all_embeddings = node_embeddings
         self._variable_embeddings = variable_embeddings
         self._bin_embeddings = bin_embeddings
-        
+
+        # Restore the epoch cap so the estimator stays re-fittable (inductive tuning temporarily
+        # lowered self.epochs to the CV-selected value for the training run above).
+        self.epochs = cap
+
         return self
     
     def return_ap_score(self):
@@ -384,29 +418,233 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 "in-vocabulary values shared with the training data, so they have no signal. "
                 "Every sample must share at least one value with the training data.")
 
-        num_existing_nodes = self._graph_data.num_nodes
-        device = next(self.model.parameters()).device
         self.model.eval()
-
         with torch.no_grad():
-            # Frozen training-node input embeddings (component_1 + component_2). New sample
-            # nodes get a zero self-loop feature (the encoder ignores it; the embedding comes
-            # entirely from the value nodes the sample connects to).
-            c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
-            c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
-            training_embeds = c1 + c2
-
-            new_sample_embeds = torch.zeros(
-                len(new_samples), self.embedding_dimension,
-                device=device, dtype=training_embeds.dtype)
-            augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
-            augmented_edge_index = self._augmented_edge_index(
-                pairs_per_sample, num_existing_nodes, device)
-            latent = self._frozen_encode(augmented_embeds, augmented_edge_index)
+            latent, num_existing_nodes = self._inductive_forward(pairs_per_sample)
             new_latent = latent[num_existing_nodes:].cpu()
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
         return pd.DataFrame(new_latent.numpy(), index=new_samples, columns=embedding_cols)
+
+    def _inductive_forward(self, pairs_per_sample):
+        """Inject new sample nodes into the frozen training graph and encode all nodes in one pass.
+
+        Builds the augmented input feature matrix (frozen training-node embeddings, i.e.
+        component_1 + component_2, followed by a zero self-loop feature per new sample), appends the
+        directed value_node -> new_sample edges, and runs the frozen encoder. Shared by transform()
+        (which slices off the new-sample rows) and the inductive-CV validation (which scores links by
+        node index against the full latent matrix).
+
+        Returns:
+            (latent, num_existing_nodes): latent embeddings for every node in the augmented graph
+            (training nodes 0..num_existing_nodes-1, then the new sample nodes), and the count of
+            pre-existing training nodes.
+        """
+        num_existing_nodes = self._graph_data.num_nodes
+        device = next(self.model.parameters()).device
+
+        # Frozen training-node input embeddings (component_1 + component_2). New sample nodes get a
+        # zero self-loop feature (the encoder ignores it; the embedding comes entirely from the value
+        # nodes the sample connects to).
+        c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
+        c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
+        training_embeds = c1 + c2
+
+        new_sample_embeds = torch.zeros(
+            len(pairs_per_sample), self.embedding_dimension,
+            device=device, dtype=training_embeds.dtype)
+        augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
+        augmented_edge_index = self._augmented_edge_index(
+            pairs_per_sample, num_existing_nodes, device)
+        latent = self._frozen_encode(augmented_embeds, augmented_edge_index)
+        return latent, num_existing_nodes
+
+    def _tune_epochs_via_cv(self, input_data):
+        """Pick the number of training epochs that best generalizes to unseen samples.
+
+        Runs a K-fold CV that holds out whole samples. All folds are trained in lockstep; every
+        ``cv_eval_every`` epochs the held-out samples of each fold are injected inductively (exactly
+        like transform()) and their positive vs. negative links are scored (ROC-AUC). Training stops
+        as soon as the mean validation AUC across folds stops improving for ``cv_patience`` checks,
+        and the epoch of the best mean AUC is returned.
+
+        Args:
+            input_data (pd.DataFrame): full training table (rows=variables, columns=samples + type).
+
+        Returns:
+            int: the CV-selected number of epochs (falls back to self.epochs when CV is infeasible).
+        """
+        sample_cols = [c for c in input_data.columns if c != self.type_column]
+        n = len(sample_cols)
+        if self.cv_folds < 2 or n < self.cv_folds:
+            print(f"[inductive] Not enough samples ({n}) for {self.cv_folds}-fold CV; "
+                  f"falling back to fixed epochs={self.epochs}.")
+            return self.epochs
+
+        kf = KFold(n_splits=self.cv_folds, shuffle=True, random_state=self.cv_seed)
+        contexts = []
+        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(sample_cols)):
+            train_df = input_data[[sample_cols[i] for i in train_idx] + [self.type_column]]
+            val_df = input_data[[sample_cols[i] for i in val_idx] + [self.type_column]]
+            ctx = self._build_cv_fold(train_df, val_df, fold_idx)
+            if ctx is not None:
+                contexts.append(ctx)
+
+        if len(contexts) < 2:
+            print(f"[inductive] Only {len(contexts)} usable CV fold(s); "
+                  f"falling back to fixed epochs={self.epochs}.")
+            return self.epochs
+
+        best_mean, best_epoch, wait = -float("inf"), self.cv_eval_every, 0
+        for e in range(self.epochs):
+            for ctx in contexts:
+                self._train_epoch(
+                    ctx["model"], ctx["optimizer"], ctx["graph_data"],
+                    ctx["neg_edges_tensor"], ctx["all_rand_indices"],
+                    ctx["combined_labels"], ctx["B"], e)
+
+            if (e + 1) % self.cv_eval_every == 0:
+                aucs = [self._cv_validate_fold(ctx) for ctx in contexts]
+                aucs = [a for a in aucs if a is not None]
+                if not aucs:
+                    continue
+                mean_auc = float(np.mean(aucs))
+                print(f"[inductive] epoch {e+1}: mean val AUC = {mean_auc:.4f} "
+                      f"(best {best_mean:.4f} @ {best_epoch})")
+                if mean_auc > best_mean + 1e-6:
+                    best_mean, best_epoch, wait = mean_auc, e + 1, 0
+                else:
+                    wait += 1
+                    if wait >= self.cv_patience:
+                        print(f"[inductive] validation AUC stopped improving; "
+                              f"selecting epochs={best_epoch}.")
+                        break
+
+        optimal = max(best_epoch, self.cv_eval_every)
+        print(f"[inductive] selected optimal epochs = {optimal} (best mean val AUC = {best_mean:.4f}).")
+        return optimal
+
+    def _build_cv_fold(self, train_df, val_df, fold_idx):
+        """Set up one CV fold: train-graph, model, training tensors, and held-out validation edges.
+
+        Uses a throwaway Embedder so the existing inductive helpers (bin mapping, value-node lookup,
+        directed injection, frozen encoding) can be reused without mutating ``self``.
+
+        Returns:
+            dict | None: fold context, or None if the fold has no trainable negatives.
+        """
+        fold = Embedder(
+            embedding_dimension=self.embedding_dimension,
+            lr=self.lr,
+            bins_per_continuous=self.bins_per_continuous,
+            epochs=self.epochs,
+            device=self.device,
+            layer_type=self.layer_type,
+            type_column=self.type_column,
+            na_encoding=self.non_informative_na,
+            informative_nas=self.informative_nas,
+            discretization_type=self.discretization_type,
+            inductive=False,
+        )
+
+        (_discrete, graph_data, _num_vars, _sample_node_dict, value_node_dict, var_value_dict,
+         neg_edges_per_pair, variable_names, variable_embedding_ids, _cont_bin_names,
+         cont_bin_embedding_ids, bin_stats) = fold.data_to_graph(
+            train_df, dtype_col=self.type_column,
+            ignore_na=self.non_informative_na, keep_na=self.informative_nas)
+
+        if not any(v.numel() > 0 for v in neg_edges_per_pair.values()):
+            return None
+
+        # Populate the attributes the inductive helpers read.
+        fold._value_node_dict = value_node_dict
+        fold._bin_stats = bin_stats
+        fold._cont_vars = set(train_df.index[train_df[self.type_column].isin(['numerical', 'cont'])])
+        fold._variable_names = variable_names
+
+        # Build the fold model (mirrors compute_node_embeddings).
+        num_embeddings = int(torch.max(graph_data.node_to_embeddings)) + 1
+        graph_data = graph_data.to(self.device)
+        variable_embedding_ids = variable_embedding_ids.to(self.device)
+        cont_bin_embedding_ids = cont_bin_embedding_ids.to(self.device)
+        fold.model = GraphAutoencoder(
+            num_embeddings=num_embeddings,
+            embedding_dim=self.embedding_dimension,
+            encoder_layer=self.layer_type,
+            node_to_embeddings_index=graph_data.node_to_embeddings,
+            variable_embeddings_ids=variable_embedding_ids,
+            bin_embedding_ids=cont_bin_embedding_ids).to(self.device)
+        fold._graph_data = graph_data
+        optimizer = torch.optim.Adam(fold.model.parameters(), lr=self.lr)
+
+        # Pre-sample negatives from a fold-local RNG so CV does not disturb the global RNG stream.
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(self.cv_seed + fold_idx)
+        neg_edges_tensor, all_rand_indices, combined_labels, B = self._prepare_training_tensors(
+            neg_edges_per_pair, graph_data, self.epochs, generator=generator)
+
+        # Precompute held-out validation edges against the fold's value vocabulary. Offsets must match
+        # _augmented_edge_index / _inductive_forward, so keep the full pairs list (including edgeless
+        # val samples, which simply contribute no edges).
+        val_samples = [c for c in val_df.columns if c != self.type_column]
+        val_data = val_df.drop(columns=[self.type_column])
+        pairs_per_sample = [fold._sample_value_node_pairs(val_data, s) for s in val_samples]
+
+        num_existing_nodes = graph_data.num_nodes
+        pos_src, pos_dst, neg_src, neg_dst = [], [], [], []
+        for offset, pairs in enumerate(pairs_per_sample):
+            val_node = num_existing_nodes + offset
+            for var, value_node in pairs:
+                pos_src.append(val_node)
+                pos_dst.append(value_node)
+                # Negatives: the other observed, non-NA values this variable can take.
+                for value_label, is_not_na in var_value_dict[var]:
+                    if not is_not_na:
+                        continue
+                    cand = value_node_dict[value_label]
+                    if cand == value_node:
+                        continue
+                    neg_src.append(val_node)
+                    neg_dst.append(cand)
+
+        pos_edge_index = torch.tensor([pos_src, pos_dst], dtype=torch.long, device=self.device)
+        neg_edge_index = torch.tensor([neg_src, neg_dst], dtype=torch.long, device=self.device)
+
+        return {
+            "fold": fold,
+            "model": fold.model,
+            "optimizer": optimizer,
+            "graph_data": graph_data,
+            "neg_edges_tensor": neg_edges_tensor,
+            "all_rand_indices": all_rand_indices,
+            "combined_labels": combined_labels,
+            "B": B,
+            "pairs_per_sample": pairs_per_sample,
+            "pos_edge_index": pos_edge_index,
+            "neg_edge_index": neg_edge_index,
+        }
+
+    def _cv_validate_fold(self, ctx):
+        """Inductively score the held-out samples of one fold and return link-prediction ROC-AUC.
+
+        Returns None when the fold has no positive or no negative validation edges (AUC undefined).
+        """
+        pos_edge_index = ctx["pos_edge_index"]
+        neg_edge_index = ctx["neg_edge_index"]
+        if pos_edge_index.numel() == 0 or neg_edge_index.numel() == 0:
+            return None
+
+        fold = ctx["fold"]
+        fold.model.eval()
+        with torch.no_grad():
+            latent, _ = fold._inductive_forward(ctx["pairs_per_sample"])
+            pos_scores = fold.model.decoder(latent, pos_edge_index).reshape(-1)
+            neg_scores = fold.model.decoder(latent, neg_edge_index).reshape(-1)
+        fold.model.train()
+
+        y_true = torch.cat([torch.ones(pos_scores.size(0)), torch.zeros(neg_scores.size(0))])
+        y_pred = torch.cat([pos_scores.cpu(), neg_scores.cpu()])
+        return roc_auc_score(y_true.numpy(), y_pred.numpy())
 
     def _move_self_tensors(self, device):
         """Move all tensor-like attributes of self to given device."""
@@ -414,41 +652,64 @@ class Embedder(BaseEstimator, ClassifierMixin):
             if hasattr(value, "to") and callable(value.to):
                 self.__dict__[name] = value.to(device)
 
-    def train_gnn(self, autoencoder, optimizer, graph_data):
-        neg_edges_list = [val for _, val in self._neg_edges_per_pair.items() if val.numel()>0]
-        neg_edges_tensor = repeat_pad_to_max_cols(neg_edges_list) 
-        
+    def _prepare_training_tensors(self, neg_edges_per_pair, graph_data, num_epochs, generator=None):
+        """Build the negative-edge pool, pre-sampled negative indices, and BCE labels for training.
+
+        Shared by train_gnn (full training) and the inductive-CV fold loop. Moves graph tensors onto
+        self.device in place. When `generator` is given, negative index sampling draws from it instead
+        of the global RNG (used by CV to stay reproducible and not disturb the final training's RNG).
+
+        Returns:
+            (neg_edges_tensor, all_rand_indices, combined_labels, B)
+        """
+        neg_edges_list = [val for _, val in neg_edges_per_pair.items() if val.numel() > 0]
+        neg_edges_tensor = repeat_pad_to_max_cols(neg_edges_list)
+
         neg_edges_tensor = neg_edges_tensor.to(self.device)
         graph_data.edge_index = graph_data.edge_index.to(self.device)
         graph_data.unique_edges = graph_data.unique_edges.to(self.device)
 
         B, _, max_cols = neg_edges_tensor.shape
-    
-        # 2. Pre-generate all random indices for all epochs at once
-        # Resulting shape: (epochs, B)
-        all_rand_indices = torch.randint(0, max_cols, (self.epochs, B), device=self.device)
 
-        # Pre-allocate labels to avoid re-creating them in the loop
+        # Pre-generate all random negative-column indices for all epochs at once. Shape: (num_epochs, B)
+        all_rand_indices = torch.randint(
+            0, max_cols, (num_epochs, B), device=self.device, generator=generator)
+
+        # Pre-allocate labels (ones for positives, zeros for the B sampled negatives).
         pos_labels = torch.ones(graph_data.unique_edges.size(1), device=self.device)
         neg_labels = torch.zeros(B, device=self.device)
         combined_labels = torch.cat([pos_labels, neg_labels], dim=0)
 
+        return neg_edges_tensor, all_rand_indices, combined_labels, B
+
+    def _train_epoch(self, autoencoder, optimizer, graph_data,
+                     neg_edges_tensor, all_rand_indices, combined_labels, B, epoch):
+        """Run one link-prediction training step and return the loss. Shared by train_gnn and CV."""
+        # --- PART 1: SAMPLING ---
+        current_indices = all_rand_indices[epoch]
+        neg_edge_index = neg_edges_tensor[torch.arange(B, device=self.device), :, current_indices].T
+        pos_neg_combined = torch.cat([graph_data.unique_edges, neg_edge_index], dim=1)
+
+        # --- PART 2: FORWARD PASS ---
+        pos_neg_similarities = autoencoder(graph_data.edge_index, pos_neg_combined)
+        loss = F.binary_cross_entropy(pos_neg_similarities, combined_labels)
+
+        # --- PART 3: BACKWARD & STEP ---
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
+
+    def train_gnn(self, autoencoder, optimizer, graph_data):
+        neg_edges_tensor, all_rand_indices, combined_labels, B = self._prepare_training_tensors(
+            self._neg_edges_per_pair, graph_data, self.epochs)
+
         # Inside your training loop:
         for epoch in range(self.epochs):
 
-            # --- PART 1: SAMPLING ---
-            current_indices = all_rand_indices[epoch]
-            neg_edge_index = neg_edges_tensor[torch.arange(B, device=self.device), :, current_indices].T
-            pos_neg_combined = torch.cat([graph_data.unique_edges, neg_edge_index], dim=1)
-
-            # --- PART 2: FORWARD PASS ---
-            pos_neg_similarities = autoencoder(graph_data.edge_index, pos_neg_combined)
-            loss = F.binary_cross_entropy(pos_neg_similarities, combined_labels)
-
-            # --- PART 3: BACKWARD & STEP ---
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            loss = self._train_epoch(
+                autoencoder, optimizer, graph_data,
+                neg_edges_tensor, all_rand_indices, combined_labels, B, epoch)
 
             if epoch % 10 == 0:
                 print(f"Step {epoch}: loss = {loss.item()}")

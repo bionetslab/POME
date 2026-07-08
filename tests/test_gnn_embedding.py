@@ -347,3 +347,76 @@ def test_informative_na_nonlinear():
                         discretization_type="nonlinear")
     embedder.fit(inf_df)
     assert embedder._ap >= 0
+
+
+# --- Inductive CV-based epoch tuning -------------------------------------------------
+
+def test_inductive_epoch_tuning():
+    # With inductive=True, fit() first runs a sample-holdout CV to pick the epoch count, then
+    # trains on all samples for that many epochs. The epoch cap must be restored afterwards.
+    TYPE_COL = "type"
+    sample_cols = [c for c in example_df.columns if c != TYPE_COL]
+    make_deterministic(42)
+    embedder = Embedder(inductive=True,
+                        epochs=60,
+                        cv_folds=3,
+                        cv_eval_every=10,
+                        cv_patience=2,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE)
+    embedder.fit(example_df)
+
+    assert hasattr(embedder, "_optimal_epochs")
+    assert 0 < embedder._optimal_epochs <= 60
+    assert embedder._optimal_epochs % embedder.cv_eval_every == 0
+    assert embedder._max_epochs == 60
+    assert embedder.epochs == 60  # cap restored so the estimator stays re-fittable
+
+    # Fitted embeddings and inductive transform still work.
+    emb_df, var_df, _, _ = embedder.get_embeddings()
+    assert emb_df.shape == (NUM_SAMPLES, DIMENSION)
+    new_embeddings = embedder.transform(example_df[sample_cols[-2:] + [TYPE_COL]])
+    assert new_embeddings.shape == (2, DIMENSION)
+
+
+def test_inductive_epoch_tuning_deterministic():
+    # Same seed + cv_seed => identical selected epoch count.
+    results = []
+    for _ in range(2):
+        make_deterministic(42)
+        embedder = Embedder(inductive=True,
+                            epochs=40,
+                            cv_folds=3,
+                            cv_eval_every=10,
+                            cv_patience=2,
+                            na_encoding=NA_ENCODING,
+                            embedding_dimension=DIMENSION,
+                            device=DEVICE)
+        embedder.fit(example_df)
+        results.append(embedder._optimal_epochs)
+    assert results[0] == results[1]
+
+
+def test_inductive_off_unchanged():
+    # Default (inductive=False) must not run CV nor set the tuning attributes.
+    embedder = Embedder(epochs=20,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE)
+    embedder.fit(example_df)
+    assert not hasattr(embedder, "_optimal_epochs")
+    assert embedder.epochs == 20
+
+
+def test_inductive_too_few_folds_fallback():
+    # More folds than samples => CV is infeasible; fit() falls back to the fixed epoch count.
+    embedder = Embedder(inductive=True,
+                        epochs=15,
+                        cv_folds=NUM_SAMPLES + 5,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE)
+    embedder.fit(example_df)
+    assert embedder._optimal_epochs == 15
+    assert embedder.epochs == 15
