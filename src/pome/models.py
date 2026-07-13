@@ -60,12 +60,19 @@ class ValueRegressor(torch.nn.Module):
     after GNN training on frozen embeddings, so it lives outside GraphAutoencoder and is
     pickled independently (like the fitted decoder).
     """
-    def __init__(self, embedding_dim, hidden_dim=None):
+    def __init__(self, embedding_dim, hidden_dim=None, dropout=0.1):
         super().__init__()
-        hidden = hidden_dim or embedding_dim
+        # Wider (2x) + deeper than a single hidden layer: one shared head must model the
+        # (sample, variable) -> value map for every continuous variable, so give it more
+        # capacity, with dropout for regularisation on the frozen-embedding features.
+        hidden = hidden_dim or embedding_dim * 2
         self.net = nn.Sequential(
             nn.Linear(embedding_dim * 2, hidden),
             nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden, 1),
         )
 

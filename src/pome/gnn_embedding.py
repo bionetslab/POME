@@ -42,9 +42,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  discretization_type : str = "z",
                  enable_imputation : bool = False,
                  epoch_checkpoints : int = -1,
-                 numeric_imputation : str = "bin_mean",
-                 regressor_epochs : int = 300,
+                 regressor_epochs : int = 600,
                  regressor_lr : float = None,
+                 regressor_weight_decay : float = 1e-4,
                  ):
         self.embedding_dimension=embedding_dimension
         self.bins_per_continuous=bins_per_continuous
@@ -61,9 +61,13 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.discretization_type = discretization_type
         self.enable_imputation = enable_imputation
         self.save_epochs = epoch_checkpoints
-        self.numeric_imputation = numeric_imputation
+        # Numeric imputation trains a small regression head on the frozen embeddings: for a
+        # missing continuous cell it predicts the value from concat(sample_encoding,
+        # variable_embedding). These knobs tune that head (training budget, learning rate,
+        # weight decay); regressor_lr=None falls back to the embedder's own lr.
         self.regressor_epochs = regressor_epochs
         self.regressor_lr = regressor_lr
+        self.regressor_weight_decay = regressor_weight_decay
 
     def fit(self, X, y=None):
         """Sklearn-based fit method for given tabular df.
@@ -75,11 +79,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 - non_informative_na (float): Encoding value of non-informative NA.
                 - informative_nas (list): List of encoding values of NAs that carry relevant information.
         """
-        if self.numeric_imputation not in ("bin_mean", "regression"):
-            raise ValueError(
-                f"Unknown numeric_imputation mode: {self.numeric_imputation}. "
-                "Choose from ['bin_mean', 'regression'].")
-
         # Translate input data into graph based format.
         input_data = X.copy()
         discrete_data, graph_data, _, sample_node_dict, value_node_dict, var_value_dict, neg_edges_per_pair, variable_names, variable_embedding_ids, cont_bin_names, cont_bin_embedding_ids, bin_stats = self.data_to_graph(
@@ -118,7 +117,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self._variable_embeddings = variable_embeddings
         self._bin_embeddings = bin_embeddings
 
-        if self.enable_imputation and self.numeric_imputation == "regression" and self._cont_vars:
+        if self.enable_imputation and self._cont_vars:
             self._fit_value_regressor()
 
         return self
@@ -191,18 +190,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
         # Extract all positions (i.e. variables) in given sample that possess this missing value.
         impute_variables = self._discretized_data.index[self._discretized_data[sample_colum] == na_value].tolist()
         
-        # Compute embedding similarities between sample and all to-impute variable nodes.
         for variable in impute_variables:
-            # Regression path for continuous variables: predict the value directly from the
-            # frozen embeddings instead of falling back to the selected bin's mean.
-            if (self.numeric_imputation == "regression"
-                    and variable in self._cont_vars
-                    and hasattr(self, "_value_regressor")
-                    and variable in self._reg_target_stats):
-                imputed_df.loc[variable, sample_colum] = self._regress_value(variable, sample_colum)
+            # Continuous variables: predict the value with the regression head trained on the
+            # frozen embeddings. A continuous variable with no training observations has no head
+            # entry -> fall back to its observed mean (NaN if it was never observed at all).
+            if variable in self._cont_vars:
+                if (hasattr(self, "_value_regressor")
+                        and variable in self._reg_target_stats):
+                    imputed_df.loc[variable, sample_colum] = self._regress_value(
+                        variable, sample_colum)
+                else:
+                    imputed_df.loc[variable, sample_colum] = self._observed_mean(variable)
                 continue
 
-            # Retrieve for each sample & category node the respective embedding.
+            # Categorical variables: pick the category whose value node the decoder scores most
+            # similar to the sample node.
             potential_categories = [value for value, is_not_na in self._var_value_dict[variable] if is_not_na]
             category_indices = torch.tensor(
                 [self._value_node_dict[value] for value in potential_categories],
@@ -222,28 +224,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
             with torch.no_grad():
                 similarities = self._fitted_decoder(self._all_embeddings, edge_index)
 
-            # Find category with highest similarity.
+            # Find category with highest similarity and extract its value.
             best_idx = torch.argmax(similarities).item()
             closest_value = potential_categories[best_idx]
-            # Extract value from category name.
-            category_value = float(closest_value.split("=")[1])
-            
-            if variable in self._cat_vars:
-                # Directly set imputed value at corresponding position in dataframe.
-                imputed_df.loc[variable, sample_colum] = category_value
-
-            elif variable in self._cont_vars:
-                bin_patients = self._discretized_data.columns[
-                    self._discretized_data.loc[variable] == category_value
-                    ].tolist()
-                if bin_patients:
-                    imputed_value = self._X.loc[variable, bin_patients].mean()
-                else:
-                    imputed_value = np.nan  # or global mean or other fallback
-
-                imputed_df.loc[variable, sample_colum] = imputed_value
+            imputed_df.loc[variable, sample_colum] = float(closest_value.split("=")[1])
 
         return imputed_df
+
+    def _observed_mean(self, variable):
+        """Observed (non-missing) mean of a continuous variable; NaN if never observed.
+
+        Fallback for continuous variables that carry no training signal for the regression
+        head (e.g. a variable missing in every training sample)."""
+        obs = self._X.loc[variable].astype(float)[
+            self._observed_continuous_mask(self._X.loc[variable])]
+        return float(obs.mean()) if len(obs) else np.nan
 
 
     def _remap_to_populated_bin(self, var, bin_id):
@@ -454,45 +449,41 @@ class Embedder(BaseEstimator, ClassifierMixin):
         return mean, std
 
     def _fit_value_regressor(self):
-        """Train a regression head on the frozen embeddings for numeric imputation.
+        """Train the regression head on the frozen embeddings for numeric imputation.
 
-        For every continuous variable, sample latent embeddings are recomputed with that
-        variable's value-node edges removed (one frozen encoder pass per continuous variable),
-        so the training features are blind to the target — matching the imputation-time
-        condition, where a missing value contributes no edge. The regressor maps
-        ``concat(sample_latent, variable_embedding) -> standardized value`` and is trained
-        full-batch (deterministic under the global seed). Cost is O(#continuous vars) frozen
-        forward passes.
-
-        Note: masking removes a variable's edges globally, so training-sample *neighbor*
-        latents differ slightly from imputation time (where only the imputed sample lacks its
-        own edge). This is the deliberate trade-off for the single-pass-per-variable design.
+        The head maps ``concat(sample_encoding, variable_embedding) -> standardized value``,
+        where the sample encoding is the raw learned node embedding (component_1 + component_2)
+        from the embedding matrix, taken before the GAT encoder. Encodings are
+        variable-independent, so a single cached matrix (``_sample_encodings``) serves both
+        training and inference and the features are identically distributed at both times.
+        Training is full-batch with an L1 loss and is deterministic under the global seed.
         """
         device = next(self.model.parameters()).device
         self.model.eval()
 
         # Populated only for variables that actually yield training pairs; a continuous
-        # variable never observed in training stays out and falls back to the bin-mean path.
+        # variable never observed in training stays out and falls back to its observed mean.
         self._reg_target_stats = {}
+
+        sample_names = list(self._sample_node_dict.keys())
+        self._reg_sample_order = {s: i for i, s in enumerate(sample_names)}
+        sample_node_idx = torch.tensor(
+            [self._sample_node_dict[s] for s in sample_names],
+            dtype=torch.long, device=device)
 
         with torch.no_grad():
             c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
             c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
             training_embeds = c1 + c2
-            ei = self._graph_data.edge_index.to(device)
+
+            # Pre-encoder sample encodings are variable-independent; cache once for inference.
+            self._sample_encodings = training_embeds[sample_node_idx].detach().to('cpu')
 
             sample_feats, var_feats, targets = [], [], []
             for var in sorted(self._cont_vars):
-                # All value nodes for this variable (bins + any informative-NA slots).
-                vnodes = torch.tensor(
-                    [self._value_node_dict[label] for label, _ in self._var_value_dict[var]],
-                    dtype=torch.long, device=device)
-                if vnodes.numel() == 0:
+                # A variable with no value nodes carries no learnable signal.
+                if not self._var_value_dict[var]:
                     continue
-                # Drop every edge incident to the variable's value nodes (edge_index is
-                # undirected, so both endpoints are checked) -> var-blind sample latents.
-                keep = ~(torch.isin(ei[0], vnodes) | torch.isin(ei[1], vnodes))
-                latent = self._frozen_encode(training_embeds, ei[:, keep])
 
                 row = self._X.loc[var]
                 obs_samples = [s for s in row.index[self._observed_continuous_mask(row)]
@@ -505,7 +496,8 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 s_idx = [self._sample_node_dict[s] for s in obs_samples]
                 var_emb = self._variable_embeddings[self._variable_names.index(var)].to(device)
 
-                feats = latent[torch.tensor(s_idx, dtype=torch.long, device=device)]
+                s_idx_t = torch.tensor(s_idx, dtype=torch.long, device=device)
+                feats = training_embeds[s_idx_t]
                 tgt = torch.tensor(
                     [(float(row[s]) - mean) / std for s in obs_samples],
                     dtype=feats.dtype, device=device)
@@ -522,13 +514,15 @@ class Embedder(BaseEstimator, ClassifierMixin):
 
         reg = ValueRegressor(self.embedding_dimension).to(device)
         lr = self.regressor_lr if self.regressor_lr is not None else self.lr
-        optimizer = torch.optim.Adam(reg.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(reg.parameters(), lr=lr,
+                                     weight_decay=self.regressor_weight_decay)
+
+        # L1 (not MSE): the imputation metric is MAE, whose minimizer is the conditional
+        # median -- targeted directly and robust to the heavy-tailed values in these datasets.
         reg.train()
         for _ in range(self.regressor_epochs):
             optimizer.zero_grad()
-            pred = reg(sample_feats, var_feats)
-            loss = F.mse_loss(pred, targets)
-            loss.backward()
+            F.l1_loss(reg(sample_feats, var_feats), targets).backward()
             optimizer.step()
         reg.eval()
         self._value_regressor = reg.to('cpu')
@@ -536,11 +530,10 @@ class Embedder(BaseEstimator, ClassifierMixin):
     def _regress_value(self, variable, sample):
         """Predict a continuous value for (variable, sample) from the frozen embeddings.
 
-        The stored sample latent is already blind to ``variable`` (its value is missing, so
-        no edge was added during fit()). The standardized prediction is de-standardized with
-        the variable's stored (mean, std).
+        Uses the cached pre-encoder sample encoding and the variable's embedding, then
+        de-standardizes the head's output with the variable's stored (mean, std).
         """
-        sample_emb = self._all_embeddings[self._sample_node_dict[sample]].unsqueeze(0)
+        sample_emb = self._sample_encodings[self._reg_sample_order[sample]].unsqueeze(0)
         var_emb = self._variable_embeddings[self._variable_names.index(variable)].unsqueeze(0)
         with torch.no_grad():
             std_pred = self._value_regressor(sample_emb, var_emb).item()
