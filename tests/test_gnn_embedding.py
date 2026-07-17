@@ -87,7 +87,52 @@ def test_epoch_checkpoints():
                         )
     embedder.fit(example_df)
     assert any(f.endswith('.joblib') for f in os.listdir('.'))
-    
+
+def test_epoch_callback_snapshots():
+    # epoch_callback fires once per epoch with a 1-indexed count and the live
+    # model; a cloned state_dict reloaded into the final model must reproduce that
+    # epoch's embeddings, and an earlier snapshot must differ.
+    seen = []
+    snaps = {}
+    def cb(epoch, autoencoder):
+        seen.append(epoch)
+        if epoch in (25, 50):
+            snaps[epoch] = {k: v.detach().clone()
+                            for k, v in autoencoder.state_dict().items()}
+
+    make_deterministic(42)
+    embedder = Embedder(epochs=50, na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION, device=DEVICE,
+                        epoch_callback=cb)
+    embedder.fit(example_df)
+
+    assert seen == list(range(1, 51))       # every epoch, 1-indexed, up to `epochs`
+    assert set(snaps) == {25, 50}
+
+    edge_index = embedder._graph_data.edge_index
+    with torch.no_grad():
+        final_nodes = embedder.model.get_embeddings(edge_index)[0]  # epoch-50 weights
+        embedder.model.load_state_dict(snaps[50])
+        nodes_50 = embedder.model.get_embeddings(edge_index)[0]
+        embedder.model.load_state_dict(snaps[25])
+        nodes_25 = embedder.model.get_embeddings(edge_index)[0]
+    assert torch.allclose(nodes_50, final_nodes)        # last snapshot == final
+    assert not torch.allclose(nodes_25, final_nodes)    # earlier snapshot differs
+
+def test_epoch_callback_does_not_perturb_training():
+    # The callback only observes; enabling it must not change the training result.
+    def fit(cb):
+        make_deterministic(42)
+        e = Embedder(epochs=30, na_encoding=NA_ENCODING,
+                     embedding_dimension=DIMENSION, device=DEVICE,
+                     epoch_callback=cb)
+        e.fit(example_df)
+        return e.get_embeddings()[0].to_numpy()
+
+    without = fit(None)
+    with_cb = fit(lambda epoch, autoencoder: None)
+    assert np.allclose(without, with_cb)
+
 def test_nonlinear_discretization():
     
     embedder = Embedder(epochs=50, 

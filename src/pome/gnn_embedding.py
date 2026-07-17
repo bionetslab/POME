@@ -44,6 +44,8 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  discretization_type : str = "z",
                  enable_imputation : bool = False,
                  epoch_checkpoints : int = -1,
+                 embedding_csv_epochs : int = -1,
+                 epoch_callback = None,
                  regressor_epochs : int = 600,
                  regressor_lr : float = None,
                  regressor_weight_decay : float = 1e-4,
@@ -68,6 +70,17 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.discretization_type = discretization_type
         self.enable_imputation = enable_imputation
         self.save_epochs = epoch_checkpoints
+        # When > 0, dump the current sample/variable/bin embeddings to CSV every
+        # `embedding_csv_epochs` epochs during training (see `train_gnn`). Disabled by default
+        # (-1); when disabled the training loop is completely unaffected.
+        self.embedding_csv_epochs = embedding_csv_epochs
+        # Optional lightweight per-epoch hook. When set to a callable, it is invoked after every
+        # training epoch as `epoch_callback(epoch, autoencoder)` where `epoch` is the number of
+        # completed epochs (1-indexed) and `autoencoder` is the live model. Unlike `epoch_checkpoints`
+        # (which joblib-dumps the whole Embedder) this persists nothing itself -- the caller decides
+        # what, if anything, to snapshot (e.g. clone `autoencoder.state_dict()` in memory). Disabled
+        # by default (None); when disabled the training loop is completely unaffected.
+        self.epoch_callback = epoch_callback
         # Numeric imputation trains a small regression head on the frozen embeddings: for a
         # missing continuous cell it predicts the value from concat(sample_encoding,
         # variable_embedding). These knobs tune that head (training budget, learning rate,
@@ -844,7 +857,15 @@ class Embedder(BaseEstimator, ClassifierMixin):
             if epoch % 10 == 0:
                 print(f"Step {epoch}: loss = {loss.item()}")
                 #print(f"Epoch {epoch} | Sample: {sample_time:.2f}ms | Forward: {forward_time:.2f}ms | Backward: {backward_time:.2f}ms")
-                
+
+            # Optional lightweight per-epoch hook (in-memory snapshots etc.). Skipped unless set.
+            if self.epoch_callback is not None:
+                self.epoch_callback(epoch + 1, autoencoder)
+
+            # Optional embedding snapshots to CSV. Fully skipped (no cost, no prints) unless enabled.
+            if self.embedding_csv_epochs > 0 and (epoch + 1) % self.embedding_csv_epochs == 0:
+                self._save_embeddings_csv(autoencoder, graph_data, epoch + 1)
+
             if self.file_name and self.save_epochs > 0 and (epoch+1) % self.save_epochs == 0 and epoch > 0:
                 # Save currently fitted decoder and embeddings to self.
                 node_embeddings, _, _ = autoencoder.get_embeddings(graph_data.edge_index)
@@ -871,6 +892,39 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 graph_data = graph_data.to(self.device)
 
     
+    def _save_embeddings_csv(self, autoencoder, graph_data, epoch):
+        """Snapshot the current sample/variable/bin embeddings to CSV files during training.
+
+        Only called when `embedding_csv_epochs > 0`. Mirrors the DataFrame construction of
+        `get_embeddings()` (same indices/columns), but operates on the mid-training model. The
+        model is briefly put in eval mode for a clean extraction and its train mode is restored
+        afterwards, so training itself is unaffected. Files are written to `output_path` (current
+        directory if unset) as `{prefix}_{kind}_embeddings_epoch_{epoch}.csv`, where `{prefix}`
+        is `file_name` when given, else "pome".
+        """
+        was_training = autoencoder.training
+        node_embeddings, variable_embeddings, bin_embeddings = autoencoder.get_embeddings(
+            graph_data.edge_index)
+        if was_training:
+            autoencoder.train()
+
+        embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
+
+        sample_rows = list(self._sample_node_dict.values())
+        sample_matrix = node_embeddings[sample_rows].detach().cpu().numpy()
+        sample_df = pd.DataFrame(sample_matrix, index=list(self._X.columns), columns=embedding_cols)
+        variable_df = pd.DataFrame(variable_embeddings.detach().cpu().numpy(),
+                                   index=self._variable_names, columns=embedding_cols)
+        bin_df = pd.DataFrame(bin_embeddings.detach().cpu().numpy(),
+                              index=self._cont_bin_names, columns=embedding_cols)
+
+        prefix = self.file_name if self.file_name else "pome"
+        out_dir = self.output_path if self.output_path else "."
+        os.makedirs(out_dir, exist_ok=True)
+        for kind, df in (("sample", sample_df), ("variable", variable_df), ("bin", bin_df)):
+            df.to_csv(os.path.join(out_dir, f"{prefix}_{kind}_embeddings_epoch_{epoch}.csv"))
+        print(f"Saved embedding CSVs for epoch {epoch} to {out_dir}.")
+
     def compute_node_embeddings(self, graph_data, variable_embeddings_ids, bin_embedding_ids):
         """Core function for fitting optimal node embeddings.
         """
