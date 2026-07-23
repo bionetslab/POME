@@ -30,6 +30,77 @@ def compute_roc(graph_data, neg_edges_per_pair, node_embeddings, decoder_model):
 
     return roc_auc, avg_precision
 
+
+def effective_rank(Z, eps: float = 1e-7):
+    """RankMe effective rank (Garrido et al. 2023) of an embedding matrix.
+
+    The entropy of the normalized singular-value spectrum, exp(-sum p_k log p_k)
+    with p_k = sigma_k / sum(sigma) + eps -- a label-free measure of how many
+    dimensions the representation effectively uses (bounded by min(n_rows, dim)).
+    Non-finite rows are dropped; returns nan if fewer than two usable rows remain.
+
+    Args:
+        Z: 2-D array/tensor (n_rows x dim).
+        eps (float): numerical floor for the singular-value probabilities.
+
+    Returns:
+        float: the effective rank (>= 1), or nan.
+    """
+    Z = torch.as_tensor(Z, dtype=torch.float32)
+    Z = Z[torch.isfinite(Z).all(dim=1)]
+    if Z.shape[0] < 2:
+        return float("nan")
+    sigma = torch.linalg.svdvals(Z)
+    p = sigma / (sigma.sum() + eps) + eps
+    return float(torch.exp(-(p * torch.log(p)).sum()))
+
+
+def matched_overfit_index(train_Z, val_Z, n_draws: int = 10, generator=None):
+    """Sample-matched, ceiling-normalized train-vs-val effective-rank gap.
+
+    effective_rank is capped/biased by row count, so a raw
+    effective_rank(train) - effective_rank(val) is confounded when the two matrices
+    have different numbers of rows. Here both are reduced to the same
+    n = min(n_train, n_val) rows (the larger one subsampled, averaged over
+    `n_draws` draws) so the cap and finite-sample bias match, then the gap is
+    normalized by the shared ceiling min(n, dim):
+
+        (effective_rank(train@n) - effective_rank(val@n)) / min(n, dim)
+
+    The residual reflects genuine geometric divergence (overfitting onset) rather
+    than the sample-count asymmetry. Both inputs must live in the same latent
+    space. Returns nan if fewer than two usable rows.
+
+    Args:
+        train_Z / val_Z: 2-D tensors (n_rows x dim) in the same latent space.
+        n_draws (int): subsampling draws for the larger matrix.
+        generator (torch.Generator): CPU RNG for reproducible subsampling.
+
+    Returns:
+        float: the normalized matched gap, or nan.
+    """
+    train_Z = torch.as_tensor(train_Z, dtype=torch.float32).detach().cpu()
+    val_Z = torch.as_tensor(val_Z, dtype=torch.float32).detach().cpu()
+    train_Z = train_Z[torch.isfinite(train_Z).all(dim=1)]
+    val_Z = val_Z[torch.isfinite(val_Z).all(dim=1)]
+    n = min(train_Z.shape[0], val_Z.shape[0])
+    d = train_Z.shape[1]
+    if n < 2:
+        return float("nan")
+
+    def matched(Z):
+        if Z.shape[0] == n:
+            return effective_rank(Z)
+        vals = [effective_rank(Z[torch.randperm(Z.shape[0], generator=generator)[:n]])
+                for _ in range(n_draws)]
+        return float(np.nanmean(vals))
+
+    rk_train, rk_val = matched(train_Z), matched(val_Z)
+    ceiling = min(n, d)
+    if not (np.isfinite(rk_train) and np.isfinite(rk_val)) or ceiling < 1:
+        return float("nan")
+    return (rk_train - rk_val) / ceiling
+
 def get_zscore_bins(K):
     if K == 15:
         return [-np.inf, -3.5, -3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, np.inf]

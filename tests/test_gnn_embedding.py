@@ -1,4 +1,6 @@
 from pome.gnn_embedding import Embedder, make_deterministic
+from pome.utils import effective_rank, matched_overfit_index
+import math
 import pandas as pd
 import torch
 import os
@@ -538,3 +540,55 @@ def test_inductive_too_few_folds_fallback():
     embedder.fit(example_df)
     assert embedder._optimal_epochs == 15
     assert embedder.epochs == 15
+
+
+# --- Label-free effective-rank metric (matched-gap stopping signal) ------------------
+
+def test_effective_rank():
+    # Identity uses all dimensions -> effective rank == n; a rank-1 (collapsed) matrix -> ~1.
+    assert abs(effective_rank(torch.eye(8)) - 8.0) < 1e-3
+    collapsed = torch.arange(1.0, 9.0).reshape(-1, 1) @ torch.ones(1, 8)  # every row colinear
+    assert effective_rank(collapsed) < 1.5
+    assert math.isnan(effective_rank(torch.ones(1, 8)))  # < 2 usable rows
+
+
+def test_matched_overfit_index():
+    gen = torch.Generator().manual_seed(0)
+    Z = torch.randn(6, 8)
+    # Identical matrices -> zero gap.
+    assert abs(matched_overfit_index(Z, Z, n_draws=5, generator=gen)) < 1e-6
+    # Train richer (full rank) than val (collapsed) -> positive gap.
+    full = torch.eye(8)
+    collapsed = torch.arange(1.0, 9.0).reshape(-1, 1) @ torch.ones(1, 8)
+    assert matched_overfit_index(full, collapsed, n_draws=5, generator=gen) > 0
+    # Fewer than two usable rows -> nan.
+    assert math.isnan(matched_overfit_index(torch.ones(1, 8), Z, n_draws=5, generator=gen))
+
+
+def test_inductive_matched_gap():
+    # Inductive CV driven by the matched-gap criterion, with explicit tuning params: it runs,
+    # selects a valid epoch budget (onset epoch, a multiple of cv_eval_every, or the full cap),
+    # restores the cap, and leaves inductive transform working.
+    TYPE_COL = "type"
+    sample_cols = [c for c in example_df.columns if c != TYPE_COL]
+    make_deterministic(42)
+    embedder = Embedder(inductive=True,
+                        epochs=60,
+                        cv_folds=3,
+                        cv_eval_every=10,
+                        cv_patience=2,
+                        overfit_tol=0.05,
+                        gap_draws=5,
+                        na_encoding=NA_ENCODING,
+                        embedding_dimension=DIMENSION,
+                        device=DEVICE)
+    embedder.fit(example_df)
+
+    assert embedder.overfit_tol == 0.05 and embedder.gap_draws == 5
+    assert 0 < embedder._optimal_epochs <= 60
+    assert embedder._optimal_epochs % embedder.cv_eval_every == 0
+    assert embedder._max_epochs == 60
+    assert embedder.epochs == 60  # cap restored
+
+    new_embeddings = embedder.transform(example_df[sample_cols[-2:] + [TYPE_COL]])
+    assert new_embeddings.shape == (2, DIMENSION)

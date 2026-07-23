@@ -9,10 +9,9 @@ import numpy as np
 from torch_geometric.seed import seed_everything
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import KFold
-from sklearn.metrics import roc_auc_score
 import joblib
 from pome.models import GraphAutoencoder, ValueRegressor
-from pome.utils import compute_roc, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
+from pome.utils import compute_roc, matched_overfit_index, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
@@ -54,6 +53,8 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  cv_eval_every : int = 10,
                  cv_patience : int = 3,
                  cv_seed : int = 42,
+                 overfit_tol : float = 0.05,
+                 gap_draws : int = 10,
                  ):
         self.embedding_dimension=embedding_dimension
         self.bins_per_continuous=bins_per_continuous
@@ -89,13 +90,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.regressor_lr = regressor_lr
         self.regressor_weight_decay = regressor_weight_decay
         # Inductive epoch tuning: when enabled, fit() first runs a sample-holdout CV to pick the
-        # number of epochs that best generalizes to unseen samples (avoids overfitting the graph),
-        # then trains on all samples for that many epochs.
+        # number of epochs that best generalizes to unseen samples, then trains on all samples for
+        # that many epochs. The stopping signal is the label-free sample-matched, ceiling-normalized
+        # train-vs-held-out RankMe gap (`matched_overfit_index`): every `cv_eval_every` epochs each
+        # fold's overfitting index is measured, and training stops at the epoch where the mean index
+        # first rises `overfit_tol` above its running minimum (confirmed over `cv_patience` checks) --
+        # the onset of the encoder overfitting the training graph. If it never widens, the full
+        # `epochs` budget is used. `gap_draws` is the subsampling count for the sample-matching;
+        # `cv_seed` seeds both the fold split and the (reproducible) subsampling RNG.
         self.inductive = inductive
         self.cv_folds = cv_folds
         self.cv_eval_every = cv_eval_every
         self.cv_patience = cv_patience
         self.cv_seed = cv_seed
+        self.overfit_tol = overfit_tol
+        self.gap_draws = gap_draws
 
     def fit(self, X, y=None):
         """Sklearn-based fit method for given tabular df.
@@ -606,16 +615,20 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """Pick the number of training epochs that best generalizes to unseen samples.
 
         Runs a K-fold CV that holds out whole samples. All folds are trained in lockstep; every
-        ``cv_eval_every`` epochs the held-out samples of each fold are injected inductively (exactly
-        like transform()) and their positive vs. negative links are scored (ROC-AUC). Training stops
-        as soon as the mean validation AUC across folds stops improving for ``cv_patience`` checks,
-        and the epoch of the best mean AUC is returned.
+        ``cv_eval_every`` epochs each fold's held-out samples are injected inductively (exactly like
+        transform()) and its sample-matched, ceiling-normalized train-vs-held-out RankMe gap
+        (``matched_overfit_index``) is measured. This label-free index is ~0 while the representation
+        generalizes and rises when the encoder starts overfitting the training graph. Training stops
+        at the epoch where the mean index first rises ``overfit_tol`` above its running minimum
+        (confirmed over ``cv_patience`` consecutive checks) -- the onset of overfitting -- and that
+        onset epoch is returned. If the gap never widens, the full ``self.epochs`` budget is returned.
 
         Args:
             input_data (pd.DataFrame): full training table (rows=variables, columns=samples + type).
 
         Returns:
-            int: the CV-selected number of epochs (falls back to self.epochs when CV is infeasible).
+            int: the CV-selected number of epochs (falls back to self.epochs when CV is infeasible
+                 or when no overfitting onset is detected).
         """
         sample_cols = [c for c in input_data.columns if c != self.type_column]
         n = len(sample_cols)
@@ -638,7 +651,15 @@ class Embedder(BaseEstimator, ClassifierMixin):
                   f"falling back to fixed epochs={self.epochs}.")
             return self.epochs
 
-        best_mean, best_epoch, wait = -float("inf"), self.cv_eval_every, 0
+        # Reproducible CPU RNG for the sample-matching subsampling (independent of the
+        # global torch stream, which fit() saves/restores around the whole CV).
+        self._cv_generator = torch.Generator().manual_seed(self.cv_seed)
+
+        # Onset detection on the mean matched-gap index: track its running minimum while it stays
+        # low, and stop once it rises `overfit_tol` above that minimum for `cv_patience` consecutive
+        # checks, returning the epoch of the first such crossing.
+        run_min = float("inf")
+        onset_epoch, wait = None, 0
         for e in range(self.epochs):
             for ctx in contexts:
                 self._train_epoch(
@@ -647,25 +668,30 @@ class Embedder(BaseEstimator, ClassifierMixin):
                     ctx["combined_labels"], ctx["B"], e)
 
             if (e + 1) % self.cv_eval_every == 0:
-                aucs = [self._cv_validate_fold(ctx) for ctx in contexts]
-                aucs = [a for a in aucs if a is not None]
-                if not aucs:
+                gaps = [self._cv_overfit_index_fold(ctx) for ctx in contexts]
+                gaps = [g for g in gaps if g is not None and np.isfinite(g)]
+                if not gaps:
                     continue
-                mean_auc = float(np.mean(aucs))
-                print(f"[inductive] epoch {e+1}: mean val AUC = {mean_auc:.4f} "
-                      f"(best {best_mean:.4f} @ {best_epoch})")
-                if mean_auc > best_mean + 1e-6:
-                    best_mean, best_epoch, wait = mean_auc, e + 1, 0
+                mean_gap = float(np.mean(gaps))
+                print(f"[inductive] epoch {e+1}: mean overfit index = {mean_gap:.4f} "
+                      f"(running min {run_min:.4f})")
+                if mean_gap <= run_min + self.overfit_tol:
+                    # Still within tolerance of the best-so-far: no overfitting yet.
+                    run_min = min(run_min, mean_gap)
+                    onset_epoch, wait = None, 0
                 else:
+                    # Above tolerance: candidate overfitting onset.
+                    if onset_epoch is None:
+                        onset_epoch = e + 1
                     wait += 1
                     if wait >= self.cv_patience:
-                        print(f"[inductive] validation AUC stopped improving; "
-                              f"selecting epochs={best_epoch}.")
-                        break
+                        print(f"[inductive] overfitting onset confirmed; "
+                              f"selecting epochs={onset_epoch}.")
+                        return max(onset_epoch, self.cv_eval_every)
 
-        optimal = max(best_epoch, self.cv_eval_every)
-        print(f"[inductive] selected optimal epochs = {optimal} (best mean val AUC = {best_mean:.4f}).")
-        return optimal
+        print(f"[inductive] no overfitting onset detected; "
+              f"selecting full budget epochs={self.epochs}.")
+        return self.epochs
 
     def _build_cv_fold(self, train_df, val_df, fold_idx):
         """Set up one CV fold: train-graph, model, training tensors, and held-out validation edges.
@@ -767,27 +793,30 @@ class Embedder(BaseEstimator, ClassifierMixin):
             "neg_edge_index": neg_edge_index,
         }
 
-    def _cv_validate_fold(self, ctx):
-        """Inductively score the held-out samples of one fold and return link-prediction ROC-AUC.
+    def _cv_overfit_index_fold(self, ctx):
+        """Return one fold's sample-matched, ceiling-normalized train-vs-held-out RankMe gap.
 
-        Returns None when the fold has no positive or no negative validation edges (AUC undefined).
+        Extracts the fold's transductive TRAIN sample embeddings and its held-out samples' INDUCTIVE
+        embeddings (both in the same L2-normalized latent space) at the current model state, and
+        feeds them to ``matched_overfit_index``. Returns None when there are no held-out samples.
         """
-        pos_edge_index = ctx["pos_edge_index"]
-        neg_edge_index = ctx["neg_edge_index"]
-        if pos_edge_index.numel() == 0 or neg_edge_index.numel() == 0:
+        fold = ctx["fold"]
+        if not ctx["pairs_per_sample"]:
             return None
 
-        fold = ctx["fold"]
         fold.model.eval()
         with torch.no_grad():
-            latent, _ = fold._inductive_forward(ctx["pairs_per_sample"])
-            pos_scores = fold.model.decoder(latent, pos_edge_index).reshape(-1)
-            neg_scores = fold.model.decoder(latent, neg_edge_index).reshape(-1)
+            # Held-out (inductive) sample embeddings: rows after the training nodes.
+            latent, num_existing_nodes = fold._inductive_forward(ctx["pairs_per_sample"])
+            val_emb = latent[num_existing_nodes:]
+            # Fold-train sample embeddings: training sample nodes are rows 0..num_samples-1
+            # (column order of the fold's train_df; see data_to_graph).
+            node_emb, _, _ = fold.model.get_embeddings(ctx["graph_data"].edge_index)
+            train_emb = node_emb[:ctx["graph_data"].num_samples]
         fold.model.train()
 
-        y_true = torch.cat([torch.ones(pos_scores.size(0)), torch.zeros(neg_scores.size(0))])
-        y_pred = torch.cat([pos_scores.cpu(), neg_scores.cpu()])
-        return roc_auc_score(y_true.numpy(), y_pred.numpy())
+        return matched_overfit_index(
+            train_emb, val_emb, n_draws=self.gap_draws, generator=self._cv_generator)
 
     def _move_self_tensors(self, device):
         """Move all tensor-like attributes of self to given device."""
