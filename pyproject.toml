@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pome-py"
-version = "1.0"
+version = "1.1"
 description = "POME: Partially observed mixed-type data embeddings"
 readme = "README.md"
 requires-python = ">=3.8"
