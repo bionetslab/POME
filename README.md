@@ -4,6 +4,10 @@
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![PyPI](https://img.shields.io/pypi/v/pome-py?color=orange)
 
+<p align="center">
+  <img width="400" height="410" alt="POME_logo-01" src="https://github.com/user-attachments/assets/67f3d5a0-da8e-4cf0-afec-c12efd4a4b14" />
+</p>
+
 POME is a graph-based representation-learning method for heterogeneous datasets that incorporates missingness structures into the computation of low-dimensional sample and variable embeddings. It is applicable to any tabular datasets consisting of both numeric- and categorical-type features, where missing data patterns are supposed to be taken into account.
 
 ## Installation
