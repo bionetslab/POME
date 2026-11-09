@@ -592,3 +592,152 @@ def test_inductive_matched_gap():
 
     new_embeddings = embedder.transform(example_df[sample_cols[-2:] + [TYPE_COL]])
     assert new_embeddings.shape == (2, DIMENSION)
+
+
+# ---------------------------------------------------------------------------------------------
+# Identifiable variable representations (non-identifiability of raw e_j / e_c / e_b)
+# ---------------------------------------------------------------------------------------------
+
+def _fitted_embedder(seed=0, **kwargs):
+    make_deterministic(seed)
+    embedder = Embedder(epochs=50, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                        device=DEVICE, **kwargs)
+    embedder.fit(example_df)
+    return embedder
+
+
+def _apply_symmetries(embedder, seed=0):
+    """Apply exact loss-preserving reparametrizations to the learned encodings in place:
+    per-categorical-variable shifts and per-node rescalings, one shared numeric shift,
+    per-sample rescaling. Returns the edge index needed to recompute z."""
+    rng = np.random.default_rng(seed)
+    model = embedder.model
+    W = model.node_embeddings.weight.data
+    n2e = model.node_to_embeddings.cpu()
+    n = len(embedder._sample_node_dict)
+    var_rows = dict(zip(embedder._variable_names, model.variable_embeddings_ids.cpu().tolist()))
+    value_rows = n2e[n:]
+    rand = lambda: torch.tensor(rng.normal(size=W.size(1)), dtype=W.dtype)
+    for var, row in var_rows.items():
+        if var in embedder._cont_vars:
+            continue
+        codes = value_rows[value_rows[:, 0] == row, 1]
+        a = rand(); W[row] += a; W[codes] -= a                  # categorical shift
+        for c in codes:                                         # per-node rescaling of e_j + e_c
+            lam = float(np.exp(rng.uniform(np.log(0.2), np.log(5))))
+            W[c] = lam * (W[row] + W[c]) - W[row]
+    num_rows = [var_rows[v] for v in embedder._variable_names if v in embedder._cont_vars]
+    a = rand(); W[num_rows] += a; W[model.bin_embedding_ids.long()] -= a   # shared numeric shift
+    W[:n] *= torch.tensor(np.exp(rng.uniform(-1, 1, size=(n, 1))), dtype=W.dtype)
+    z, _, _ = model.get_embeddings(embedder._graph_data.edge_index)
+    return z
+
+
+def test_latent_embeddings_invariant_to_encoding_symmetries():
+    embedder = _fitted_embedder()
+    z_before = embedder._all_embeddings.clone()
+    z_after = _apply_symmetries(embedder)
+    assert torch.allclose(z_before, z_after, atol=1e-5)
+
+
+def test_variable_and_bin_representations_invariant():
+    embedder = _fitted_embedder()
+    _, var_before, bin_before, _ = embedder.get_embeddings()
+    _, raw_before, _, _ = embedder.get_embeddings(raw=True)
+    concept_before = embedder.get_numeric_concept_embeddings()
+    value_before = embedder.get_value_node_embeddings(level="input")
+    embedder._all_embeddings = _apply_symmetries(embedder)
+    _, var_after, bin_after, _ = embedder.get_embeddings()
+    _, raw_after, _, _ = embedder.get_embeddings(raw=True)
+    raw_after = pd.DataFrame(embedder.model.node_embeddings.weight.detach()[
+        embedder.model.variable_embeddings_ids].numpy(), index=raw_after.index,
+        columns=raw_after.columns)
+    np.testing.assert_allclose(var_before.to_numpy(), var_after.to_numpy(), atol=1e-5)
+    np.testing.assert_allclose(bin_before.to_numpy(), bin_after.to_numpy(), atol=1e-5)
+    np.testing.assert_allclose(concept_before.to_numpy(),
+                               embedder.get_numeric_concept_embeddings().to_numpy(), atol=1e-5)
+    np.testing.assert_allclose(value_before.to_numpy(),
+                               embedder.get_value_node_embeddings(level="input").to_numpy(),
+                               atol=1e-5)
+    # Sanity check that the transform did something: the raw encodings change.
+    assert not np.allclose(raw_before.to_numpy(), raw_after.to_numpy(), atol=1e-3)
+
+
+def test_raw_embeddings_match_learned_encodings():
+    embedder = _fitted_embedder()
+    _, raw_df, raw_bins, _ = embedder.get_embeddings(raw=True)
+    np.testing.assert_allclose(raw_df.to_numpy(), embedder._variable_embeddings.numpy())
+    np.testing.assert_allclose(raw_bins.to_numpy(), embedder._bin_embeddings.numpy())
+
+
+def test_variable_representation_is_value_node_centroid():
+    embedder = _fitted_embedder()
+    _, var_df, _, _ = embedder.get_embeddings()
+    values = embedder.get_value_node_embeddings(level="input")
+    for var in var_df.index:
+        rows = [label for label in values.index if label.split("=")[0] == var]
+        np.testing.assert_allclose(var_df.loc[var].to_numpy(),
+                                   values.loc[rows].mean(axis=0).to_numpy(), atol=1e-6)
+    norms = embedder.get_variable_centroid_norms()
+    np.testing.assert_allclose(norms.to_numpy(), np.linalg.norm(var_df.to_numpy(), axis=1),
+                               atol=1e-6)
+    assert (norms <= 1 + 1e-6).all()
+
+
+def test_numeric_concepts_centred_and_scaled():
+    embedder = _fitted_embedder()
+    concepts = embedder.get_numeric_concept_embeddings()
+    assert list(concepts.index) == [v for v in embedder._variable_names if v in CONT_VARS]
+    np.testing.assert_allclose(concepts.mean(axis=0).to_numpy(), 0, atol=1e-6)
+    assert np.isclose(np.linalg.norm(concepts.to_numpy(), axis=1).mean(), 1.0)
+
+
+def test_value_node_embeddings_levels():
+    embedder = _fitted_embedder()
+    latent = embedder.get_value_node_embeddings(level="latent")
+    inputs = embedder.get_value_node_embeddings(level="input")
+    assert list(latent.index) == list(embedder._value_node_dict.keys())
+    assert latent.shape == inputs.shape and latent.shape[1] == DIMENSION
+    np.testing.assert_allclose(np.linalg.norm(inputs.to_numpy(), axis=1), 1, atol=1e-5)
+    row = embedder._value_node_dict[latent.index[0]]
+    np.testing.assert_allclose(latent.iloc[0].to_numpy(), embedder._all_embeddings[row].numpy())
+    with pytest.raises(ValueError):
+        embedder.get_value_node_embeddings(level="foo")
+
+
+def _refit_regressor(embedder, seed=0):
+    torch.manual_seed(seed)
+    embedder._fit_value_regressor()
+    return {(v, s): embedder._regress_value(v, s)
+            for v in sorted(embedder._reg_target_stats) for s in list(embedder._sample_node_dict)[:5]}
+
+
+def test_regressor_inputs_invariant_to_encoding_symmetries():
+    embedder = _fitted_embedder(enable_imputation=True)
+    assert embedder.regressor_inputs == "invariant"
+    before = _refit_regressor(embedder)
+    samples_before = embedder._sample_encodings.clone()
+    vars_before = {k: v.clone() for k, v in embedder._reg_variable_features.items()}
+    head = embedder._value_regressor
+    _apply_symmetries(embedder)
+    _refit_regressor(embedder)                 # recomputes the input features
+    assert torch.allclose(samples_before, embedder._sample_encodings, atol=1e-5)
+    for k, v in vars_before.items():
+        assert torch.allclose(v, embedder._reg_variable_features[k], atol=1e-5)
+    # The same trained head gives the same imputations. (Retraining the head is not compared:
+    # full-batch L1 training amplifies float-level input differences, for any input choice.)
+    embedder._value_regressor = head
+    after = {k: embedder._regress_value(*k) for k in before}
+    assert before and all(abs(before[k] - after[k]) < 1e-4 for k in before)
+
+
+def test_raw_regressor_inputs_option():
+    make_deterministic(0)
+    embedder = Embedder(epochs=50, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                        device=DEVICE, regressor_inputs="raw", enable_imputation=True)
+    embedder.fit(example_df)
+    k = embedder._variable_names.index(sorted(embedder._reg_variable_features)[0])
+    assert torch.equal(embedder._reg_variable_features[embedder._variable_names[k]],
+                       embedder._variable_embeddings[k].detach().cpu())
+    with pytest.raises(ValueError):
+        Embedder(regressor_inputs="other")

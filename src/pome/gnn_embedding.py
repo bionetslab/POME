@@ -48,6 +48,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  regressor_epochs : int = 600,
                  regressor_lr : float = None,
                  regressor_weight_decay : float = 1e-4,
+                 regressor_inputs : str = "invariant",
                  inductive : bool = False,
                  cv_folds : int = 3,
                  cv_eval_every : int = 10,
@@ -89,6 +90,13 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.regressor_epochs = regressor_epochs
         self.regressor_lr = regressor_lr
         self.regressor_weight_decay = regressor_weight_decay
+        # Inputs of the regression head. "invariant" (default): the sample node's normalized
+        # input feature and the numeric concept encoding of the variable, both invariant to the
+        # reparametrizations of the encoding table that leave the model unchanged. "raw": the raw
+        # learned sample encoding and raw variable encoding (behaviour of POME <= 1.1).
+        if regressor_inputs not in ("invariant", "raw"):
+            raise ValueError("regressor_inputs must be 'invariant' or 'raw'.")
+        self.regressor_inputs = regressor_inputs
         # Inductive epoch tuning: when enabled, fit() first runs a sample-holdout CV to pick the
         # number of epochs that best generalizes to unseen samples, then trains on all samples for
         # that many epochs. The stopping signal is the label-free sample-matched, ceiling-normalized
@@ -185,34 +193,160 @@ class Embedder(BaseEstimator, ClassifierMixin):
         return np.array([])  # placeholder
     
 
-    def get_embeddings(self):
-        """Extract given set of precomputed embeddings.
-        Args:
-            sample_subset (list[int], optional): List of sample indices whose embeddings to return. Defaults to None.
-        """
+    # ------------------------------------------------------------------ variable representations
+    #
+    # The initial value-node features are normalize(e_j + e_c) / normalize(e_j + e_b). The loss,
+    # all GAT outputs and all link predictions depend only on these normalized sums, so the raw
+    # learned encodings are not identifiable on their own:
+    #   * categorical: e_j -> e_j + a, e_c -> e_c - a (per variable), and each sum e_j + e_c can
+    #     be rescaled by its own positive factor -- raw categorical e_j carry no meaning;
+    #   * numeric: e_j -> e_j + a for all numeric j and e_b -> e_b - a for all bins (one shared
+    #     shift), plus one global scale;
+    #   * all encodings: one global rotation (absorbed by the first GAT layer).
+    # The helpers below return representations that are invariant to all shifts and rescalings
+    # (only defined up to the global rotation, which leaves cosines/distances unchanged).
+
+    def _check_fitted(self):
         if not hasattr(self, '_all_embeddings'):
             raise ValueError("Run fit() first before extracting sample embeddings!")
+
+    @torch.no_grad()
+    def _value_node_inputs(self, model=None):
+        """Normalized initial value-node features h0 for every graph node (CPU tensor)."""
+        model = self.model if model is None else model
+        W = model.node_embeddings.weight.detach().cpu()
+        n2e = model.node_to_embeddings.cpu()
+        h0 = W[n2e[:, 0]] + W[n2e[:, 1]]
+        return h0 / h0.norm(p=2, dim=1, keepdim=True)
+
+    def _value_nodes_per_variable(self, model=None):
+        """Map variable name -> LongTensor of its value-node ids in the graph."""
+        model = self.model if model is None else model
+        n2e = model.node_to_embeddings.cpu()
+        var_rows = model.variable_embeddings_ids.cpu().tolist()
+        num_samples = len(self._sample_node_dict)
+        is_value = torch.arange(n2e.size(0)) >= num_samples
+        return {var: torch.nonzero(is_value & (n2e[:, 0] == row)).flatten()
+                for var, row in zip(self._variable_names, var_rows)}
+
+    def _variable_centroids(self, model=None):
+        """Per variable: mean of its normalized value-node inputs h0 (and the centroid norms)."""
+        h0 = self._value_node_inputs(model)
+        nodes = self._value_nodes_per_variable(model)
+        cen = torch.full((len(self._variable_names), h0.size(1)), float('nan'))
+        for k, var in enumerate(self._variable_names):
+            if nodes[var].numel():
+                cen[k] = h0[nodes[var]].mean(dim=0)
+        return cen.numpy(), cen.norm(p=2, dim=1).numpy()
+
+    @torch.no_grad()
+    def _numeric_concepts_and_bins(self, model=None):
+        """Numeric variable encodings and bin encodings with the shared shift and scale removed.
+
+        Numeric e_j are centred over numeric variables, bin encodings e_b over the bins used by
+        at least one numeric value node (unused bins receive no gradient and stay NaN). Both are
+        divided by the same factor (mean norm of the centred numeric e_j) to remove the global
+        scale. Returns (numeric_variable_names, concept_matrix, bin_matrix).
+        """
+        model = self.model if model is None else model
+        W = model.node_embeddings.weight.detach().cpu()
+        n2e = model.node_to_embeddings.cpu()
+        var_rows = dict(zip(self._variable_names, model.variable_embeddings_ids.cpu().tolist()))
+        num_vars = [v for v in self._variable_names if v in self._cont_vars]
+        bin_rows = model.bin_embedding_ids.cpu().long()
+        d = W.size(1)
+        if not num_vars:
+            return [], np.zeros((0, d)), np.full((len(bin_rows), d), np.nan)
+        concepts = W[[var_rows[v] for v in num_vars]]
+        concepts = concepts - concepts.mean(dim=0, keepdim=True)
+        num_var_rows = torch.tensor([var_rows[v] for v in num_vars])
+        num_samples = len(self._sample_node_dict)
+        value_rows = n2e[num_samples:]
+        used = torch.isin(bin_rows, value_rows[torch.isin(value_rows[:, 0], num_var_rows), 1])
+        bins = torch.full((len(bin_rows), d), float('nan'), dtype=W.dtype)
+        if used.any():
+            used_bins = W[bin_rows[used]]
+            bins[used] = used_bins - used_bins.mean(dim=0, keepdim=True)
+        scale = concepts.norm(p=2, dim=1).mean()
+        if scale > 0:
+            concepts, bins = concepts / scale, bins / scale
+        return num_vars, concepts.numpy(), bins.numpy()
+
+    def get_variable_centroid_norms(self):
+        """Norm of each variable's centroid representation (see `get_embeddings`).
+
+        A centroid norm close to zero means the variable's value nodes point in nearly opposite
+        directions; cosine similarities involving that variable are then numerically unstable.
+        """
+        self._check_fitted()
+        _, norms = self._variable_centroids()
+        return pd.Series(norms, index=self._variable_names, name="centroid_norm")
+
+    def get_numeric_concept_embeddings(self):
+        """Learned shared-concept encodings e_j of the numeric variables.
+
+        Because bin encodings are shared across all numeric variables, these are identified by the
+        training objective up to one common shift, one global scale and a global rotation; the
+        returned vectors are centred and scale-normalized, so differences e_j - e_j' (and cosines
+        / distances between them) are well defined. Categorical variables have no identifiable
+        encoding of this kind and are not included.
+        """
+        self._check_fitted()
+        names, concepts, _ = self._numeric_concepts_and_bins()
+        cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
+        return pd.DataFrame(concepts, index=names, columns=cols)
+
+    def get_value_node_embeddings(self, level="input"):
+        """Embeddings of all value nodes (categories and numeric bins), indexed "variable=value".
+
+        Args:
+            level (str): "input" for the normalized initial features normalize(e_j + e_c) fed into
+                the GAT encoder, "latent" for the encoder outputs z (same space as the sample
+                embeddings). Both are invariant to the encoding shifts/rescalings.
+        """
+        self._check_fitted()
+        if level == "input":
+            matrix = self._value_node_inputs()
+        elif level == "latent":
+            matrix = self._all_embeddings.detach().cpu()
         else:
-            embedding_matrix = self._all_embeddings
+            raise ValueError(f"Unknown level '{level}'. Choose from ['input', 'latent'].")
+        labels = list(self._value_node_dict.keys())
+        rows = [self._value_node_dict[label] for label in labels]
+        cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
+        return pd.DataFrame(matrix[rows].numpy(), index=labels, columns=cols)
+
+    def get_embeddings(self, raw=False):
+        """Extract the computed embeddings.
+
+        Args:
+            raw (bool): If False (default), variable embeddings are the mean of each variable's
+                normalized value-node inputs (identical for numeric and categorical variables,
+                invariant to the non-identifiable encoding shifts/rescalings) and bin embeddings
+                are centred and scale-normalized. If True, return the raw learned encodings
+                e_j / e_b as in POME <= 1.1 -- these are NOT identifiable (see class comments)
+                and should not be compared via cosine similarity.
+
+        Returns:
+            (sample_df, variable_df, bin_df, sample_to_attention_index). All embeddings are
+            defined up to a global rotation; use cosine/Euclidean geometry, or align runs (e.g.
+            Procrustes) before comparing raw coordinates across runs.
+        """
+        self._check_fitted()
+        if raw:
             variable_matrix = self._variable_embeddings
             bin_matrix = self._bin_embeddings
-            sample_rows = list(self._sample_node_dict.values())
-            sample_embedding_matrix = embedding_matrix[sample_rows]
-            sample_to_attention_index = {sample: row for row, sample in enumerate(self._sample_node_dict.keys())}
-            # Initialize sample embedding matrix.
-            sample_embedding_matrix = sample_embedding_matrix.numpy()
-            embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
-            embedding_rows = list(self._X.columns)
-            embedding_df = pd.DataFrame(sample_embedding_matrix, index=embedding_rows, columns=embedding_cols)
-            # Init variable embeddings df.
-            variable_rows = self._variable_names
-            variable_cols = embedding_cols
-            variable_df = pd.DataFrame(variable_matrix, index=variable_rows, columns=variable_cols)
-            # Init cont-bin embeddings df.
-            bin_rows = self._cont_bin_names
-            bin_cols = embedding_cols
-            bin_df = pd.DataFrame(bin_matrix, index=bin_rows, columns=bin_cols)
-            return embedding_df, variable_df, bin_df, sample_to_attention_index
+        else:
+            variable_matrix, _ = self._variable_centroids()
+            _, _, bin_matrix = self._numeric_concepts_and_bins()
+        sample_rows = list(self._sample_node_dict.values())
+        sample_to_attention_index = {sample: row for row, sample in enumerate(self._sample_node_dict.keys())}
+        embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
+        embedding_df = pd.DataFrame(self._all_embeddings[sample_rows].numpy(),
+                                    index=list(self._X.columns), columns=embedding_cols)
+        variable_df = pd.DataFrame(variable_matrix, index=self._variable_names, columns=embedding_cols)
+        bin_df = pd.DataFrame(bin_matrix, index=self._cont_bin_names, columns=embedding_cols)
+        return embedding_df, variable_df, bin_df, sample_to_attention_index
 
     def impute_all(self, na_value : float):
         """Impute missing values for all samples in dataframe based on fitted node embeddings.
@@ -490,10 +624,13 @@ class Embedder(BaseEstimator, ClassifierMixin):
     def _fit_value_regressor(self):
         """Train the regression head on the frozen embeddings for numeric imputation.
 
-        The head maps ``concat(sample_encoding, variable_embedding) -> standardized value``,
-        where the sample encoding is the raw learned node embedding (component_1 + component_2)
-        from the embedding matrix, taken before the GAT encoder. Encodings are
-        variable-independent, so a single cached matrix (``_sample_encodings``) serves both
+        The head maps ``concat(sample_feature, variable_feature) -> standardized value``. With
+        ``regressor_inputs="invariant"`` (default) the sample feature is the sample node's
+        normalized input feature (the model's own input, taken before the GAT encoder) and the
+        variable feature is the numeric concept encoding (see ``get_numeric_concept_embeddings``);
+        both are invariant to the encoding-table reparametrizations that leave the model
+        unchanged. ``"raw"`` uses the raw learned encodings instead (POME <= 1.1). Sample features
+        are variable-independent, so a single cached matrix (``_sample_encodings``) serves both
         training and inference and the features are identically distributed at both times.
         Training is full-batch with an L1 loss and is deterministic under the global seed.
         """
@@ -514,8 +651,18 @@ class Embedder(BaseEstimator, ClassifierMixin):
             c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
             c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
             training_embeds = c1 + c2
+            if self.regressor_inputs == "invariant":
+                training_embeds = training_embeds / training_embeds.norm(p=2, dim=1, keepdim=True)
+                names, concepts, _ = self._numeric_concepts_and_bins()
+                self._reg_variable_features = {
+                    v: torch.tensor(concepts[k], dtype=training_embeds.dtype)
+                    for k, v in enumerate(names)}
+            else:
+                self._reg_variable_features = {
+                    v: self._variable_embeddings[k].detach().cpu()
+                    for k, v in enumerate(self._variable_names) if v in self._cont_vars}
 
-            # Pre-encoder sample encodings are variable-independent; cache once for inference.
+            # Pre-encoder sample features are variable-independent; cache once for inference.
             self._sample_encodings = training_embeds[sample_node_idx].detach().to('cpu')
 
             sample_feats, var_feats, targets = [], [], []
@@ -533,7 +680,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 mean, std = self._reg_target_standardization(var)
                 self._reg_target_stats[var] = (mean, std)
                 s_idx = [self._sample_node_dict[s] for s in obs_samples]
-                var_emb = self._variable_embeddings[self._variable_names.index(var)].to(device)
+                var_emb = self._reg_variable_features[var].to(device)
 
                 s_idx_t = torch.tensor(s_idx, dtype=torch.long, device=device)
                 feats = training_embeds[s_idx_t]
@@ -569,11 +716,14 @@ class Embedder(BaseEstimator, ClassifierMixin):
     def _regress_value(self, variable, sample):
         """Predict a continuous value for (variable, sample) from the frozen embeddings.
 
-        Uses the cached pre-encoder sample encoding and the variable's embedding, then
+        Uses the cached pre-encoder sample feature and the variable's feature, then
         de-standardizes the head's output with the variable's stored (mean, std).
         """
         sample_emb = self._sample_encodings[self._reg_sample_order[sample]].unsqueeze(0)
-        var_emb = self._variable_embeddings[self._variable_names.index(variable)].unsqueeze(0)
+        if hasattr(self, "_reg_variable_features"):
+            var_emb = self._reg_variable_features[variable].unsqueeze(0)
+        else:  # embedder pickled with POME <= 1.1
+            var_emb = self._variable_embeddings[self._variable_names.index(variable)].unsqueeze(0)
         with torch.no_grad():
             std_pred = self._value_regressor(sample_emb, var_emb).item()
         mean, std = self._reg_target_stats[variable]
@@ -932,20 +1082,20 @@ class Embedder(BaseEstimator, ClassifierMixin):
         is `file_name` when given, else "pome".
         """
         was_training = autoencoder.training
-        node_embeddings, variable_embeddings, bin_embeddings = autoencoder.get_embeddings(
-            graph_data.edge_index)
+        node_embeddings, _, _ = autoencoder.get_embeddings(graph_data.edge_index)
         if was_training:
             autoencoder.train()
+        # Same (identifiable) variable/bin representations as get_embeddings(raw=False).
+        variable_matrix, _ = self._variable_centroids(autoencoder)
+        _, _, bin_matrix = self._numeric_concepts_and_bins(autoencoder)
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
 
         sample_rows = list(self._sample_node_dict.values())
         sample_matrix = node_embeddings[sample_rows].detach().cpu().numpy()
         sample_df = pd.DataFrame(sample_matrix, index=list(self._X.columns), columns=embedding_cols)
-        variable_df = pd.DataFrame(variable_embeddings.detach().cpu().numpy(),
-                                   index=self._variable_names, columns=embedding_cols)
-        bin_df = pd.DataFrame(bin_embeddings.detach().cpu().numpy(),
-                              index=self._cont_bin_names, columns=embedding_cols)
+        variable_df = pd.DataFrame(variable_matrix, index=self._variable_names, columns=embedding_cols)
+        bin_df = pd.DataFrame(bin_matrix, index=self._cont_bin_names, columns=embedding_cols)
 
         prefix = self.file_name if self.file_name else "pome"
         out_dir = self.output_path if self.output_path else "."
