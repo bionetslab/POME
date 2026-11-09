@@ -83,6 +83,7 @@ POME's Embedder class allows for the specification of the following parameters:
 
 ### Imputation
 - `enable_imputation : bool = False`: Set this to true if you want to use POME for imputation after training. It has to be set at construction time.
+- `regressor_inputs : str = "invariant"`: Inputs of the regression head used for numeric imputation. `"invariant"` uses the sample node's normalized input feature and the numeric concept encoding of the variable (see the note on variable encodings below); `"raw"` uses the raw learned encodings (behaviour of POME ≤ 1.1).
 
 ### Inductive epoch tuning
 With `inductive=True`, `fit()` does not train for a fixed number of epochs. It first runs a cross-validation that holds out whole samples and picks the epoch count that best generalizes to unseen ones, using a label-free train-vs-held-out effective-rank gap as the stopping signal. The selected value is stored in `_optimal_epochs`, while `epochs` serves as the upper cap and is restored after fitting.
@@ -101,9 +102,23 @@ All of these are disabled by default and add no cost to the training loop when u
 After initializing the Embedder object, the main functions for using POME are:
 
 - `fit(X, y=None)`: Training POME on the given input dataframe, with the input format as specified above.
-- `get_embeddings()`: Return computed embeddings in dataframe format. Output is a four-tuple of sample embeddings (position 0), variable embeddings (position 1), continuous-bin embeddings (position 2), and a mapping from sample name to its row in the attention matrix (position 3).
+- `get_embeddings(raw=False)`: Return computed embeddings in dataframe format. Output is a four-tuple of sample embeddings (position 0), variable embeddings (position 1), continuous-bin embeddings (position 2), and a mapping from sample name to its row in the attention matrix (position 3). Variable embeddings are the mean of each variable's normalized value-node inputs (same definition for numeric and categorical variables); bin embeddings are centred and scale-normalized. `raw=True` returns the raw learned encodings instead (behaviour of POME ≤ 1.1) — see the note below before using them.
+- `get_value_node_embeddings(level="input")`: Embeddings of all value nodes (categories and numeric bins), indexed `"variable=value"`. `level="input"` gives the normalized initial features fed into the encoder, `level="latent"` the encoder outputs (same space as the sample embeddings).
+- `get_numeric_concept_embeddings()`: Learned shared-concept encodings of the numeric variables, centred and scale-normalized.
+- `get_variable_centroid_norms()`: Norm of each variable embedding. Values close to zero mean that the variable's value nodes point in nearly opposite directions, so cosine similarities involving that variable are unstable.
 - `transform(X)`: Embed new, unseen samples with the frozen trained encoder, without retraining. `X` must contain exactly the same variables as the training data plus the type column, and every sample must share at least one observed, known value with the training data — a sample whose values are all missing or unseen carries no signal and raises. Returns a `(num_new_samples, embedding_dimension)` dataframe.
 - `impute_all(na_value : float)`: Imputes all missing values specified by `na_value` in the input dataset, and directly returns the imputed dataframe. Categorical values are imputed by scoring candidate values with the trained decoder, continuous ones by a regression head trained on the frozen embeddings. Requires `enable_imputation=True`.
+
+
+### Note on variable encodings
+
+The input feature of a value node is the normalized sum of a variable encoding and a value encoding (`e_j + e_c` for categories, `e_j + e_b` for numeric bins). The model only ever sees these normalized sums, so the individual learned encodings are not uniquely determined:
+
+- For categorical variables, `e_j` can be shifted against its category encodings (and each sum rescaled) without changing the model. Raw categorical variable encodings therefore carry no meaning on their own.
+- For numeric variables, bin encodings are shared across variables, which pins down the `e_j` up to one common shift and one global scale. `get_numeric_concept_embeddings()` removes both.
+- All embeddings, including the sample embeddings, are only defined up to a global rotation. Cosine similarities and distances are unaffected, but raw coordinates of different runs should be aligned (e.g. by Procrustes) before being compared.
+
+The default outputs of `get_embeddings()` and the other getters above are invariant to all of these ambiguities except the rotation.
 
 
 ## License
