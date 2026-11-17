@@ -53,6 +53,8 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  negatives : str = "sampled",
                  init : str = "spectral",
                  anchor_weight : float = float("inf"),
+                 train_variable_encodings : bool = True,
+                 variable_anchor_weight : float = 0.1,
                  gram_anchor_weight : float = 10.0,
                  gram_reference_components : int = 8,
                  inductive : bool = False,
@@ -137,6 +139,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
         if not anchor_weight >= 0:
             raise ValueError("anchor_weight must be >= 0 (or float('inf')).")
         self.anchor_weight = float(anchor_weight)
+        # With a frozen table (anchor_weight=inf): keep the variable rows e_j trainable, starting
+        # from their (spectral) initialization, while sample rows and value rows (categories,
+        # numeric bins, NA codes) stay frozen. With the value rows fixed, e_j is no longer subject
+        # to the shift/rescale ambiguity of a fully learnable table. No effect for finite
+        # anchor_weight (all rows are trainable there anyway). Default True: e_j are learned,
+        # anchored to their init with variable_anchor_weight (default 0.1). Set False for the
+        # POME 1.3 behaviour (fully frozen table).
+        self.train_variable_encodings = bool(train_variable_encodings)
+        # With train_variable_encodings: adds variable_anchor_weight * mean_j ||e_j - e_j_init||^2,
+        # keeping the trained variable rows near their (spectral) initialization. 0 = no anchor,
+        # inf is equivalent to train_variable_encodings=False. Default 0.1 (e_j anchor scan:
+        # e_j move ~45 % from init, stay reproducible across seeds; sample-level stability unchanged).
+        if not variable_anchor_weight >= 0:
+            raise ValueError("variable_anchor_weight must be >= 0.")
+        self.variable_anchor_weight = float(variable_anchor_weight)
         # Output Gram anchor: adds gram_anchor_weight * mean_ij (z_i.z_j - x_i.x_j)^2 over the
         # training samples, where z_i are the (unit-length) GAT outputs and x_i the unit-length
         # spectral sample coordinates (utils.spectral_sample_embedding). It pins the sample-sample
@@ -375,16 +392,25 @@ class Embedder(BaseEstimator, ClassifierMixin):
         cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
         return pd.DataFrame(matrix[rows].numpy(), index=labels, columns=cols)
 
+    def _value_rows_fixed(self):
+        """True if the value encodings (categories, bins, NA codes) are frozen (anchor_weight=inf).
+
+        Then e_j + e_v has no shift/rescale ambiguity and the raw variable encodings e_j are
+        identifiable (up to the global rotation shared by all embeddings).
+        """
+        return self.anchor_weight == float("inf")
+
     def get_embeddings(self, raw=False):
         """Extract the computed embeddings.
 
         Args:
-            raw (bool): If False (default), variable embeddings are the mean of each variable's
-                normalized value-node inputs (identical for numeric and categorical variables,
-                invariant to the non-identifiable encoding shifts/rescalings) and bin embeddings
-                are centred and scale-normalized. If True, return the raw learned encodings
-                e_j / e_b as in POME <= 1.1 -- these are NOT identifiable (see class comments)
-                and should not be compared via cosine similarity.
+            raw (bool): If False (default), variable embeddings are the learned encodings e_j when
+                the value encodings are frozen (anchor_weight=inf, the default since 1.3; e_j is
+                then identifiable), and otherwise the mean of each variable's normalized
+                value-node inputs (invariant to the encoding shifts/rescalings of a fully
+                learnable table); bin embeddings are centred and scale-normalized. If True,
+                return the raw stored encodings e_j / e_b as in POME <= 1.1 -- with a learnable
+                table these are NOT identifiable (see class comments).
 
         Returns:
             (sample_df, variable_df, bin_df, sample_to_attention_index). All embeddings are
@@ -396,7 +422,10 @@ class Embedder(BaseEstimator, ClassifierMixin):
             variable_matrix = self._variable_embeddings
             bin_matrix = self._bin_embeddings
         else:
-            variable_matrix, _ = self._variable_centroids()
+            if self._value_rows_fixed():
+                variable_matrix = self._variable_embeddings
+            else:
+                variable_matrix, _ = self._variable_centroids()
             _, _, bin_matrix = self._numeric_concepts_and_bins()
         sample_rows = list(self._sample_node_dict.values())
         sample_to_attention_index = {sample: row for row, sample in enumerate(self._sample_node_dict.keys())}
@@ -1114,6 +1143,13 @@ class Embedder(BaseEstimator, ClassifierMixin):
             drift = autoencoder.node_embeddings.weight - anchor
             loss = loss + self.anchor_weight * drift.pow(2).sum(dim=1).mean()
 
+        # Optional anchoring of trainable variable rows to their initialization.
+        var_anchor = getattr(autoencoder, "variable_anchor", None)
+        if var_anchor is not None:
+            ids = autoencoder.variable_embeddings_ids.to(var_anchor.device)
+            drift = autoencoder.node_embeddings.weight[ids] - var_anchor
+            loss = loss + self.variable_anchor_weight * drift.pow(2).sum(dim=1).mean()
+
         # Optional output Gram anchor on the sample nodes (nodes 0..num_samples-1).
         if gram_ref is not None:
             loss = loss + self.gram_anchor_weight * gram_discrepancy(
@@ -1122,6 +1158,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
         # --- PART 3: BACKWARD & STEP ---
         optimizer.zero_grad()
         loss.backward()
+        grad_mask = getattr(autoencoder, "encoding_grad_mask", None)
+        if grad_mask is not None and autoencoder.node_embeddings.weight.grad is not None:
+            autoencoder.node_embeddings.weight.grad.mul_(grad_mask)
         optimizer.step()
         return loss
 
@@ -1135,7 +1174,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 model.node_to_embeddings, weight)
             weight.copy_(table.to(weight.device))
         if self.anchor_weight == float("inf"):
-            weight.requires_grad_(False)
+            if self.train_variable_encodings:
+                # Only variable rows receive gradients (mask applied in _train_epoch). Adam has no
+                # weight decay here, so rows with zero gradient stay exactly at their init.
+                mask = torch.zeros(weight.shape[0], 1, device=weight.device)
+                mask[model.variable_embeddings_ids.to(weight.device)] = 1.0
+                model.register_buffer("encoding_grad_mask", mask)
+                if 0 < self.variable_anchor_weight < float("inf"):
+                    model.register_buffer("variable_anchor",
+                                          weight[model.variable_embeddings_ids.to(weight.device)]
+                                          .detach().clone())
+                elif self.variable_anchor_weight == float("inf"):
+                    del model.encoding_grad_mask
+                    weight.requires_grad_(False)
+            else:
+                weight.requires_grad_(False)
         elif self.anchor_weight > 0:
             model.register_buffer("anchor_table", weight.detach().clone())
         if self.gram_anchor_weight > 0:
@@ -1218,7 +1271,11 @@ class Embedder(BaseEstimator, ClassifierMixin):
         if was_training:
             autoencoder.train()
         # Same (identifiable) variable/bin representations as get_embeddings(raw=False).
-        variable_matrix, _ = self._variable_centroids(autoencoder)
+        if self._value_rows_fixed():
+            variable_matrix = autoencoder.node_embeddings.weight.detach().cpu()[
+                autoencoder.variable_embeddings_ids.cpu()].numpy()
+        else:
+            variable_matrix, _ = self._variable_centroids(autoencoder)
         _, _, bin_matrix = self._numeric_concepts_and_bins(autoencoder)
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]

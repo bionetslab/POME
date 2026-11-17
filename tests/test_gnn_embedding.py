@@ -7,6 +7,14 @@ import os
 import numpy as np
 import pytest
 import joblib
+import tempfile
+from contextlib import contextmanager
+
+
+@contextmanager
+def tempfile_path():
+    with tempfile.TemporaryDirectory() as d:
+        yield os.path.join(d, "e.joblib")
 
 example_df = pd.read_csv("example.csv", index_col=0)
 NA_ENCODING = -99.0
@@ -641,7 +649,7 @@ def test_latent_embeddings_invariant_to_encoding_symmetries():
 
 
 def test_variable_and_bin_representations_invariant():
-    embedder = _fitted_embedder()
+    embedder = _fitted_embedder(anchor_weight=0.0)  # learnable table -> centroid
     _, var_before, bin_before, _ = embedder.get_embeddings()
     _, raw_before, _, _ = embedder.get_embeddings(raw=True)
     concept_before = embedder.get_numeric_concept_embeddings()
@@ -671,7 +679,7 @@ def test_raw_embeddings_match_learned_encodings():
 
 
 def test_variable_representation_is_value_node_centroid():
-    embedder = _fitted_embedder()
+    embedder = _fitted_embedder(anchor_weight=0.0)  # learnable table -> centroid
     _, var_df, _, _ = embedder.get_embeddings()
     values = embedder.get_value_node_embeddings(level="input")
     for var in var_df.index:
@@ -682,6 +690,14 @@ def test_variable_representation_is_value_node_centroid():
     np.testing.assert_allclose(norms.to_numpy(), np.linalg.norm(var_df.to_numpy(), axis=1),
                                atol=1e-6)
     assert (norms <= 1 + 1e-6).all()
+
+
+def test_variable_embeddings_are_learned_encodings_with_fixed_value_rows():
+    embedder = _fitted_embedder()  # defaults: frozen value rows, trainable anchored e_j
+    _, var_df, _, _ = embedder.get_embeddings()
+    learned = embedder.model.node_embeddings.weight.detach().cpu()[
+        embedder.model.variable_embeddings_ids.cpu()].numpy()
+    np.testing.assert_allclose(var_df.to_numpy(), learned, atol=1e-6)
 
 
 def test_numeric_concepts_centred_and_scaled():
@@ -846,7 +862,8 @@ def test_anchor_weight_limits_table_drift():
     def drift(weight):
         make_deterministic(0)
         e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                     device=DEVICE, init="spectral", anchor_weight=weight)
+                     device=DEVICE, init="spectral", anchor_weight=weight,
+                     train_variable_encodings=False)
         init = {}
         orig = e._initialize_encodings
         def spy(model, graph):
@@ -858,6 +875,49 @@ def test_anchor_weight_limits_table_drift():
     with pytest.raises(ValueError):
         Embedder(anchor_weight=-1.0)
     free, anchored, frozen = drift(0.0), drift(10.0), drift(float("inf"))
+    assert frozen == 0.0
+    assert anchored < free
+
+
+def test_train_variable_encodings_updates_only_variable_rows():
+    make_deterministic(0)
+    e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                 device=DEVICE, train_variable_encodings=True)
+    init = {}
+    orig = e._initialize_encodings
+    def spy(model, graph):
+        orig(model, graph)
+        init["w"] = model.node_embeddings.weight.detach().clone()
+    e._initialize_encodings = spy
+    e.fit(example_df)
+    moved = (e.model.node_embeddings.weight.detach() - init["w"]).norm(dim=1) > 0
+    var_rows = torch.zeros_like(moved)
+    var_rows[e.model.variable_embeddings_ids.cpu()] = True
+    assert moved[var_rows].any()
+    assert not moved[~var_rows].any()
+    del e._initialize_encodings  # drop the test spy before pickling
+    with tempfile_path() as path:
+        joblib.dump(e, path)
+        assert joblib.load(path).get_embeddings()[1].shape == e.get_embeddings()[1].shape
+
+
+def test_variable_anchor_weight_limits_variable_drift():
+    def drift(w):
+        make_deterministic(0)
+        e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                     device=DEVICE, train_variable_encodings=True, variable_anchor_weight=w)
+        init = {}
+        orig = e._initialize_encodings
+        def spy(model, graph):
+            orig(model, graph)
+            init["w"] = model.node_embeddings.weight.detach().clone()
+        e._initialize_encodings = spy
+        e.fit(example_df)
+        ids = e.model.variable_embeddings_ids.cpu()
+        return (e.model.node_embeddings.weight.detach().cpu()[ids] - init["w"].cpu()[ids]).norm().item()
+    with pytest.raises(ValueError):
+        Embedder(variable_anchor_weight=-1.0)
+    free, anchored, frozen = drift(0.0), drift(100.0), drift(float("inf"))
     assert frozen == 0.0
     assert anchored < free
 
