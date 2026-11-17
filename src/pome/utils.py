@@ -225,3 +225,142 @@ def repeat_pad_to_max_cols(tensor_list):
 
     return torch.stack(padded_list)  # shape: (B, 2, max_cols)
 
+
+
+def _spectral_components(unique_edges, num_samples, num_nodes, d):
+    """Non-trivial singular triplets of the degree-normalized sample x value biadjacency.
+
+    Returns (U, S, V) with at most d components (first, trivial degree component dropped),
+    sorted by decreasing singular value, signs fixed so that each component's largest-|.|
+    sample entry is positive. Deterministic given the graph.
+    """
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import svds
+
+    src, dst = unique_edges.detach().cpu().numpy()
+    num_values = num_nodes - num_samples
+    A = sp.csr_matrix((np.ones(len(src)), (src, dst - num_samples)),
+                      shape=(num_samples, num_values))
+    A.data[:] = 1.0  # duplicate edges count once
+    deg_s = np.maximum(np.asarray(A.sum(axis=1)).ravel(), 1.0)
+    deg_v = np.maximum(np.asarray(A.sum(axis=0)).ravel(), 1.0)
+    A_hat = sp.diags(deg_s ** -0.5) @ A @ sp.diags(deg_v ** -0.5)
+
+    k = min(d + 1, min(A_hat.shape) - 1)
+    if k < 1:
+        return np.zeros((num_samples, 0)), np.zeros(0), np.zeros((num_values, 0))
+    U, S, Vt = svds(A_hat, k=k, random_state=0, solver="arpack",
+                    v0=np.ones(min(A_hat.shape)))
+    order = np.argsort(-S)
+    U, S, V = U[:, order][:, 1:], S[order][1:], Vt[order].T[:, 1:]
+    signs = np.sign(U[np.abs(U).argmax(axis=0), np.arange(U.shape[1])])
+    signs[signs == 0] = 1.0
+    return U * signs, S, V * signs
+
+
+def spectral_sample_embedding(unique_edges, num_samples, num_nodes, d):
+    """Unit-length spectral sample coordinates x_i = U_i Sigma^1/2 (at most d components).
+
+    The reference geometry of the output Gram anchor: its Gram matrix X X^T holds the cosine
+    similarities of the samples in the spectral embedding of the bipartite sample-value graph.
+    No padding, so the result is fully deterministic (also when fewer than d components exist).
+
+    Returns:
+        Tensor[num_samples, c] (float32, CPU), c <= d.
+    """
+    U, S, _ = _spectral_components(unique_edges, num_samples, num_nodes, d)
+    X = U * np.sqrt(S)
+    n = np.linalg.norm(X, axis=1, keepdims=True)
+    X = np.where(n > 0, X / np.where(n > 0, n, 1.0), X)
+    return torch.tensor(X, dtype=torch.float32)
+
+
+def gram_discrepancy(Z, X):
+    """Mean squared difference of the Gram matrices, mean_ij (z_i.z_j - x_i.x_j)^2.
+
+    Computed as (||Z^T Z||^2 - 2 ||Z^T X||^2 + ||X^T X||^2) / n^2, which needs only d x d
+    products (O(n d^2) time, O(d^2) memory) instead of the n x n Gram matrices. Invariant to
+    rotations of Z (and of X).
+    """
+    n = Z.shape[0]
+    zz = (Z.T @ Z).pow(2).sum()
+    zx = (Z.T @ X).pow(2).sum()
+    xx = (X.T @ X).pow(2).sum()
+    return (zz - 2 * zx + xx) / (n * n)
+
+
+def spectral_encoding_table(unique_edges, num_samples, num_nodes, node_to_embeddings,
+                            base_table, als_iters=100):
+    """Spectral (bipartite Laplacian-eigenmap / MCA) initialization of POME's encoding table.
+
+    1. Biadjacency A (samples x value nodes) from the positive sample->value edges, degree
+       normalized, D_s^-1/2 A D_v^-1/2, truncated SVD; the first (trivial, degree) component is
+       dropped. Sample targets x_i = U_i Sigma^1/2, value-node targets t_v = V_v Sigma^1/2, each
+       scaled to unit length. Component signs are fixed (largest-|.| sample entry positive), so
+       the result is deterministic.
+    2. Sample rows (node -> [i, i]) are set to x_i.
+    3. Value nodes use normalize(e_a + e_b) (variable row a, value row b). The shared rows are
+       fitted to the targets by least squares, sum_v ||e_a(v) + e_b(v) - t_v||^2, with alternating
+       means: variable rows start at the mean target of their value nodes, then value rows and
+       variable rows are updated in turn. Rows that belong to one variable only (categories) are
+       matched exactly; rows shared across variables (numeric bins, informative NAs) get the
+       best additive fit.
+
+    If the graph supports fewer than d non-trivial components the remaining coordinates are
+    filled from ``base_table`` scaled by 1e-2; rows not used by any node keep ``base_table``.
+
+    Args:
+        unique_edges (LongTensor[2, E]): sample node -> value node edges.
+        num_samples (int), num_nodes (int): node counts (samples are nodes 0..num_samples-1).
+        node_to_embeddings (LongTensor[num_nodes, 2]): table rows summed per node.
+        base_table (Tensor[num_rows, d]): current (random) table, used for padding / unused rows.
+
+    Returns:
+        Tensor[num_rows, d] (float32, CPU).
+    """
+    base = base_table.detach().cpu().double()
+    num_rows, d = base.shape
+    U, S, V = _spectral_components(unique_edges, num_samples, num_nodes, d)
+    c = U.shape[1]
+    X = np.zeros((num_samples, d))
+    T = np.zeros((num_nodes - num_samples, d))
+    X[:, :c] = U * np.sqrt(S)
+    T[:, :c] = V * np.sqrt(S)
+    if c < d:  # pad missing components with small noise from the base table
+        n2e = node_to_embeddings.cpu().numpy()
+        X[:, c:] = 1e-2 * base.numpy()[n2e[:num_samples, 0], c:]
+        T[:, c:] = 1e-2 * (base.numpy()[n2e[num_samples:, 0], c:]
+                           + base.numpy()[n2e[num_samples:, 1], c:])
+
+    def unit(M):
+        n = np.linalg.norm(M, axis=1, keepdims=True)
+        return np.where(n > 0, M / np.where(n > 0, n, 1.0), M)
+
+    X, T = unit(X), unit(T)
+    W = base.numpy().copy()
+    n2e = node_to_embeddings.cpu().numpy()
+    W[n2e[:num_samples, 0]] = X
+
+    a, b = n2e[num_samples:, 0], n2e[num_samples:, 1]
+    used_a, inv_a = np.unique(a, return_inverse=True)
+    used_b, inv_b = np.unique(b, return_inverse=True)
+    cnt_a = np.bincount(inv_a, minlength=len(used_a))[:, None]
+    cnt_b = np.bincount(inv_b, minlength=len(used_b))[:, None]
+
+    def group_mean(values, inv, cnt):
+        out = np.zeros((cnt.shape[0], d))
+        np.add.at(out, inv, values)
+        return out / cnt
+
+    E_a = group_mean(T, inv_a, cnt_a)
+    E_b = np.zeros((len(used_b), d))
+    for _ in range(als_iters):
+        E_b = group_mean(T - E_a[inv_a], inv_b, cnt_b)
+        E_a_new = group_mean(T - E_b[inv_b], inv_a, cnt_a)
+        if np.allclose(E_a_new, E_a, atol=1e-10):
+            E_a = E_a_new
+            break
+        E_a = E_a_new
+    W[used_a] = E_a
+    W[used_b] = E_b
+    return torch.tensor(W, dtype=torch.float32)
