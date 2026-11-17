@@ -603,7 +603,7 @@ def test_inductive_matched_gap():
 
 
 # ---------------------------------------------------------------------------------------------
-# Identifiable variable representations (non-identifiability of raw e_j / e_c / e_b)
+# Variable / bin / value-node embeddings
 # ---------------------------------------------------------------------------------------------
 
 def _fitted_embedder(seed=0, **kwargs):
@@ -614,98 +614,12 @@ def _fitted_embedder(seed=0, **kwargs):
     return embedder
 
 
-def _apply_symmetries(embedder, seed=0):
-    """Apply exact loss-preserving reparametrizations to the learned encodings in place:
-    per-categorical-variable shifts and per-node rescalings, one shared numeric shift,
-    per-sample rescaling. Returns the edge index needed to recompute z."""
-    rng = np.random.default_rng(seed)
-    model = embedder.model
-    W = model.node_embeddings.weight.data
-    n2e = model.node_to_embeddings.cpu()
-    n = len(embedder._sample_node_dict)
-    var_rows = dict(zip(embedder._variable_names, model.variable_embeddings_ids.cpu().tolist()))
-    value_rows = n2e[n:]
-    rand = lambda: torch.tensor(rng.normal(size=W.size(1)), dtype=W.dtype)
-    for var, row in var_rows.items():
-        if var in embedder._cont_vars:
-            continue
-        codes = value_rows[value_rows[:, 0] == row, 1]
-        a = rand(); W[row] += a; W[codes] -= a                  # categorical shift
-        for c in codes:                                         # per-node rescaling of e_j + e_c
-            lam = float(np.exp(rng.uniform(np.log(0.2), np.log(5))))
-            W[c] = lam * (W[row] + W[c]) - W[row]
-    num_rows = [var_rows[v] for v in embedder._variable_names if v in embedder._cont_vars]
-    a = rand(); W[num_rows] += a; W[model.bin_embedding_ids.long()] -= a   # shared numeric shift
-    W[:n] *= torch.tensor(np.exp(rng.uniform(-1, 1, size=(n, 1))), dtype=W.dtype)
-    z, _, _ = model.get_embeddings(embedder._graph_data.edge_index)
-    return z
-
-
-def test_latent_embeddings_invariant_to_encoding_symmetries():
-    embedder = _fitted_embedder()
-    z_before = embedder._all_embeddings.clone()
-    z_after = _apply_symmetries(embedder)
-    assert torch.allclose(z_before, z_after, atol=1e-5)
-
-
-def test_variable_and_bin_representations_invariant():
-    embedder = _fitted_embedder(anchor_weight=0.0)  # learnable table -> centroid
-    _, var_before, bin_before, _ = embedder.get_embeddings()
-    _, raw_before, _, _ = embedder.get_embeddings(raw=True)
-    concept_before = embedder.get_numeric_concept_embeddings()
-    value_before = embedder.get_value_node_embeddings(level="input")
-    embedder._all_embeddings = _apply_symmetries(embedder)
-    _, var_after, bin_after, _ = embedder.get_embeddings()
-    _, raw_after, _, _ = embedder.get_embeddings(raw=True)
-    raw_after = pd.DataFrame(embedder.model.node_embeddings.weight.detach()[
-        embedder.model.variable_embeddings_ids].numpy(), index=raw_after.index,
-        columns=raw_after.columns)
-    np.testing.assert_allclose(var_before.to_numpy(), var_after.to_numpy(), atol=1e-5)
-    np.testing.assert_allclose(bin_before.to_numpy(), bin_after.to_numpy(), atol=1e-5)
-    np.testing.assert_allclose(concept_before.to_numpy(),
-                               embedder.get_numeric_concept_embeddings().to_numpy(), atol=1e-5)
-    np.testing.assert_allclose(value_before.to_numpy(),
-                               embedder.get_value_node_embeddings(level="input").to_numpy(),
-                               atol=1e-5)
-    # Sanity check that the transform did something: the raw encodings change.
-    assert not np.allclose(raw_before.to_numpy(), raw_after.to_numpy(), atol=1e-3)
-
-
-def test_raw_embeddings_match_learned_encodings():
-    embedder = _fitted_embedder()
-    _, raw_df, raw_bins, _ = embedder.get_embeddings(raw=True)
-    np.testing.assert_allclose(raw_df.to_numpy(), embedder._variable_embeddings.numpy())
-    np.testing.assert_allclose(raw_bins.to_numpy(), embedder._bin_embeddings.numpy())
-
-
-def test_variable_representation_is_value_node_centroid():
-    embedder = _fitted_embedder(anchor_weight=0.0)  # learnable table -> centroid
-    _, var_df, _, _ = embedder.get_embeddings()
-    values = embedder.get_value_node_embeddings(level="input")
-    for var in var_df.index:
-        rows = [label for label in values.index if label.split("=")[0] == var]
-        np.testing.assert_allclose(var_df.loc[var].to_numpy(),
-                                   values.loc[rows].mean(axis=0).to_numpy(), atol=1e-6)
-    norms = embedder.get_variable_centroid_norms()
-    np.testing.assert_allclose(norms.to_numpy(), np.linalg.norm(var_df.to_numpy(), axis=1),
-                               atol=1e-6)
-    assert (norms <= 1 + 1e-6).all()
-
-
 def test_variable_embeddings_are_learned_encodings_with_fixed_value_rows():
     embedder = _fitted_embedder()  # defaults: frozen value rows, trainable anchored e_j
     _, var_df, _, _ = embedder.get_embeddings()
     learned = embedder.model.node_embeddings.weight.detach().cpu()[
         embedder.model.variable_embeddings_ids.cpu()].numpy()
     np.testing.assert_allclose(var_df.to_numpy(), learned, atol=1e-6)
-
-
-def test_numeric_concepts_centred_and_scaled():
-    embedder = _fitted_embedder()
-    concepts = embedder.get_numeric_concept_embeddings()
-    assert list(concepts.index) == [v for v in embedder._variable_names if v in CONT_VARS]
-    np.testing.assert_allclose(concepts.mean(axis=0).to_numpy(), 0, atol=1e-6)
-    assert np.isclose(np.linalg.norm(concepts.to_numpy(), axis=1).mean(), 1.0)
 
 
 def test_value_node_embeddings_levels():
@@ -721,42 +635,25 @@ def test_value_node_embeddings_levels():
         embedder.get_value_node_embeddings(level="foo")
 
 
-def _refit_regressor(embedder, seed=0):
-    torch.manual_seed(seed)
-    embedder._fit_value_regressor()
-    return {(v, s): embedder._regress_value(v, s)
-            for v in sorted(embedder._reg_target_stats) for s in list(embedder._sample_node_dict)[:5]}
-
-
-def test_regressor_inputs_invariant_to_encoding_symmetries():
+def test_regressor_uses_learned_variable_encodings():
     embedder = _fitted_embedder(enable_imputation=True)
-    assert embedder.regressor_inputs == "invariant"
-    before = _refit_regressor(embedder)
-    samples_before = embedder._sample_encodings.clone()
-    vars_before = {k: v.clone() for k, v in embedder._reg_variable_features.items()}
-    head = embedder._value_regressor
-    _apply_symmetries(embedder)
-    _refit_regressor(embedder)                 # recomputes the input features
-    assert torch.allclose(samples_before, embedder._sample_encodings, atol=1e-5)
-    for k, v in vars_before.items():
-        assert torch.allclose(v, embedder._reg_variable_features[k], atol=1e-5)
-    # The same trained head gives the same imputations. (Retraining the head is not compared:
-    # full-batch L1 training amplifies float-level input differences, for any input choice.)
-    embedder._value_regressor = head
-    after = {k: embedder._regress_value(*k) for k in before}
-    assert before and all(abs(before[k] - after[k]) < 1e-4 for k in before)
+    _, var_df, _, _ = embedder.get_embeddings()
+    assert embedder._reg_variable_features
+    for var, feat in embedder._reg_variable_features.items():
+        np.testing.assert_allclose(feat.numpy(), var_df.loc[var].to_numpy(), atol=1e-6)
 
 
-def test_raw_regressor_inputs_option():
-    make_deterministic(0)
-    embedder = Embedder(epochs=50, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                        device=DEVICE, regressor_inputs="raw", enable_imputation=True)
-    embedder.fit(example_df)
-    k = embedder._variable_names.index(sorted(embedder._reg_variable_features)[0])
-    assert torch.equal(embedder._reg_variable_features[embedder._variable_names[k]],
-                       embedder._variable_embeddings[k].detach().cpu())
-    with pytest.raises(ValueError):
-        Embedder(regressor_inputs="other")
+def test_embeddings_are_learned_encodings():
+    embedder = _fitted_embedder()
+    _, var_df, bin_df, _ = embedder.get_embeddings()
+    W = embedder.model.node_embeddings.weight.detach().cpu()
+    np.testing.assert_allclose(var_df.to_numpy(),
+                               W[embedder.model.variable_embeddings_ids.cpu()].numpy(), atol=1e-6)
+    used = embedder._used_bin_mask().numpy()
+    bins = W[embedder.model.bin_embedding_ids.cpu().long()].numpy()
+    assert used.any()
+    np.testing.assert_allclose(bin_df.to_numpy()[used], bins[used], atol=1e-6)
+    assert np.isnan(bin_df.to_numpy()[~used]).all()
 
 
 def test_training_noise_options_validated():
@@ -825,12 +722,10 @@ def test_all_negatives_fit_is_reproducible_and_supports_inductive():
 
 def test_spectral_init_validated_and_deterministic():
     from pome.models import GraphAutoencoder
-    with pytest.raises(ValueError):
-        Embedder(init="pca")
     inputs = []
     for seed in (0, 1):
         make_deterministic(seed)
-        e = Embedder(embedding_dimension=8, epochs=1, na_encoding=NA_ENCODING, init="spectral")
+        e = Embedder(embedding_dimension=8, epochs=1, na_encoding=NA_ENCODING)
         out = e.data_to_graph(example_df, dtype_col="type", ignore_na=NA_ENCODING, keep_na=[])
         graph = out[1]
         model = GraphAutoencoder(int(graph.node_to_embeddings.max()) + 1, 8, "GAT",
@@ -850,7 +745,7 @@ def test_spectral_init_validated_and_deterministic():
 def test_spectral_init_fit_and_transform():
     make_deterministic(0)
     e = Embedder(epochs=30, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                 device=DEVICE, init="spectral", inductive=True, cv_folds=2, cv_eval_every=10)
+                 device=DEVICE, inductive=True, cv_folds=2, cv_eval_every=10)
     e.fit(example_df)
     emb = e.get_embeddings()[0]
     assert emb.shape == (NUM_SAMPLES, DIMENSION) and np.isfinite(emb.to_numpy()).all()
@@ -858,31 +753,10 @@ def test_spectral_init_fit_and_transform():
     assert e.transform(new_df).shape == (2, DIMENSION)
 
 
-def test_anchor_weight_limits_table_drift():
-    def drift(weight):
-        make_deterministic(0)
-        e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                     device=DEVICE, init="spectral", anchor_weight=weight,
-                     train_variable_encodings=False)
-        init = {}
-        orig = e._initialize_encodings
-        def spy(model, graph):
-            orig(model, graph)
-            init["w"] = model.node_embeddings.weight.detach().clone()
-        e._initialize_encodings = spy
-        e.fit(example_df)
-        return (e.model.node_embeddings.weight.detach() - init["w"]).norm().item()
-    with pytest.raises(ValueError):
-        Embedder(anchor_weight=-1.0)
-    free, anchored, frozen = drift(0.0), drift(10.0), drift(float("inf"))
-    assert frozen == 0.0
-    assert anchored < free
-
-
-def test_train_variable_encodings_updates_only_variable_rows():
+def test_only_variable_rows_are_trained():
     make_deterministic(0)
     e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                 device=DEVICE, train_variable_encodings=True)
+                 device=DEVICE)
     init = {}
     orig = e._initialize_encodings
     def spy(model, graph):
@@ -905,7 +779,7 @@ def test_variable_anchor_weight_limits_variable_drift():
     def drift(w):
         make_deterministic(0)
         e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                     device=DEVICE, train_variable_encodings=True, variable_anchor_weight=w)
+                     device=DEVICE, variable_anchor_weight=w)
         init = {}
         orig = e._initialize_encodings
         def spy(model, graph):
@@ -942,7 +816,7 @@ def test_gram_anchor_pulls_output_geometry_to_spectral_reference():
     def discrepancy(weight):
         make_deterministic(0)
         e = Embedder(epochs=60, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
-                     device=DEVICE, init="spectral", gram_anchor_weight=weight)
+                     device=DEVICE, gram_anchor_weight=weight)
         e.fit(example_df)
         assert (getattr(e.model, "gram_reference", None) is not None) == (weight > 0)
         g = e._graph_data
@@ -1002,7 +876,7 @@ def test_gram_reference_components_selects_top_k():
             Embedder(gram_reference_components=bad)
     make_deterministic(0)
     e = Embedder(epochs=20, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION, device=DEVICE,
-                 init="spectral", anchor_weight=float("inf"), gram_anchor_weight=10.0,
+                 gram_anchor_weight=10.0,
                  gram_reference_components=2, inductive=True, cv_folds=2, cv_eval_every=10)
     e.fit(example_df)
     g = e._graph_data

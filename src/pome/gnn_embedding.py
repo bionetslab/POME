@@ -48,12 +48,8 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  regressor_epochs : int = 600,
                  regressor_lr : float = None,
                  regressor_weight_decay : float = 1e-4,
-                 regressor_inputs : str = "invariant",
                  lr_schedule : str = "cosine",
                  negatives : str = "sampled",
-                 init : str = "spectral",
-                 anchor_weight : float = float("inf"),
-                 train_variable_encodings : bool = True,
                  variable_anchor_weight : float = 0.1,
                  gram_anchor_weight : float = 10.0,
                  gram_reference_components : int = 8,
@@ -98,13 +94,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.regressor_epochs = regressor_epochs
         self.regressor_lr = regressor_lr
         self.regressor_weight_decay = regressor_weight_decay
-        # Inputs of the regression head. "invariant" (default): the sample node's normalized
-        # input feature and the numeric concept encoding of the variable, both invariant to the
-        # reparametrizations of the encoding table that leave the model unchanged. "raw": the raw
-        # learned sample encoding and raw variable encoding (behaviour of POME <= 1.1).
-        if regressor_inputs not in ("invariant", "raw"):
-            raise ValueError("regressor_inputs must be 'invariant' or 'raw'.")
-        self.regressor_inputs = regressor_inputs
         # Learning-rate schedule of the GNN training. "cosine" (default since 1.3) / "linear":
         # decay from `lr` to 0 over the trained epochs, so the parameters settle instead of ending
         # at a random point of the optimizer's noise ball. "constant" (POME <= 1.2): Adam at `lr`
@@ -121,45 +110,25 @@ class Embedder(BaseEstimator, ClassifierMixin):
         if negatives not in ("sampled", "all"):
             raise ValueError("negatives must be 'sampled' or 'all'.")
         self.negatives = negatives
-        # Initialization of the encoding table. "spectral" (default since 1.3): sample rows and
-        # value-node inputs start at the spectral embedding (degree-normalized SVD) of the
-        # bipartite sample-value graph; the shared variable / value rows are fitted to it by least
-        # squares (see utils.spectral_encoding_table). Deterministic given the data; only the GAT
-        # and decoder weights remain randomly initialized. "random" (POME <= 1.2): Xavier-uniform
-        # rows scaled to unit length.
-        if init not in ("random", "spectral"):
-            raise ValueError("init must be 'random' or 'spectral'.")
-        self.init = init
-        # Anchoring of the encoding table to its initialization: adds
-        # anchor_weight * mean_rows ||W - W_init||^2 to the link-prediction loss, so training stays
-        # near the (deterministic) spectral solution instead of drifting away from it.
-        # float("inf") (default since 1.3) freezes the table entirely (only GAT and decoder are
-        # trained); 0 disables the anchor and lets the table be learned freely (POME <= 1.2).
-        # Meant for init="spectral"; with init="random" it anchors to the random draw.
-        if not anchor_weight >= 0:
-            raise ValueError("anchor_weight must be >= 0 (or float('inf')).")
-        self.anchor_weight = float(anchor_weight)
-        # With a frozen table (anchor_weight=inf): keep the variable rows e_j trainable, starting
-        # from their (spectral) initialization, while sample rows and value rows (categories,
-        # numeric bins, NA codes) stay frozen. With the value rows fixed, e_j is no longer subject
-        # to the shift/rescale ambiguity of a fully learnable table. No effect for finite
-        # anchor_weight (all rows are trainable there anyway). Default True: e_j are learned,
-        # anchored to their init with variable_anchor_weight (default 0.1). Set False for the
-        # POME 1.3 behaviour (fully frozen table).
-        self.train_variable_encodings = bool(train_variable_encodings)
-        # With train_variable_encodings: adds variable_anchor_weight * mean_j ||e_j - e_j_init||^2,
-        # keeping the trained variable rows near their (spectral) initialization. 0 = no anchor,
-        # inf is equivalent to train_variable_encodings=False. Default 0.1 (e_j anchor scan:
-        # e_j move ~45 % from init, stay reproducible across seeds; sample-level stability unchanged).
+        # Encoding table. Each node's input feature is normalize(e_a + e_b) over table rows (samples:
+        # their own row; value nodes: variable row e_j + value row e_v, with e_v a category, numeric
+        # bin or NA code). The table is initialized from the spectral embedding (degree-normalized
+        # SVD) of the bipartite sample-value graph; the shared variable / value rows are fitted to
+        # it by least squares (see utils.spectral_encoding_table). Deterministic given the data.
+        # Sample and value rows stay fixed at this initialization. The variable encodings e_j are
+        # learned, with the penalty variable_anchor_weight * mean_j ||e_j - e_j_init||^2 keeping
+        # them near their spectral initialization (default 0.1; 0 = no anchor, inf = frozen e_j).
+        # Because the value rows are fixed, the learned e_j are identifiable and can be compared
+        # directly via cosine similarity.
         if not variable_anchor_weight >= 0:
-            raise ValueError("variable_anchor_weight must be >= 0.")
+            raise ValueError("variable_anchor_weight must be >= 0 (or float('inf')).")
         self.variable_anchor_weight = float(variable_anchor_weight)
         # Output Gram anchor: adds gram_anchor_weight * mean_ij (z_i.z_j - x_i.x_j)^2 over the
         # training samples, where z_i are the (unit-length) GAT outputs and x_i the unit-length
         # spectral sample coordinates (utils.spectral_sample_embedding). It pins the sample-sample
         # cosine geometry of the output -- the quantity downstream clustering / kNN / probes see --
-        # to a deterministic reference, while leaving rotations of the output free. Works with
-        # either init; default 10 (since 1.3), 0 disables it (POME <= 1.2).
+        # to a deterministic reference, while leaving rotations of the output free. Default 10,
+        # 0 disables it.
         if not (gram_anchor_weight >= 0 and np.isfinite(gram_anchor_weight)):
             raise ValueError("gram_anchor_weight must be a finite number >= 0.")
         self.gram_anchor_weight = float(gram_anchor_weight)
@@ -269,18 +238,11 @@ class Embedder(BaseEstimator, ClassifierMixin):
         return np.array([])  # placeholder
     
 
-    # ------------------------------------------------------------------ variable representations
+    # ------------------------------------------------------------------ embedding getters
     #
-    # The initial value-node features are normalize(e_j + e_c) / normalize(e_j + e_b). The loss,
-    # all GAT outputs and all link predictions depend only on these normalized sums, so the raw
-    # learned encodings are not identifiable on their own:
-    #   * categorical: e_j -> e_j + a, e_c -> e_c - a (per variable), and each sum e_j + e_c can
-    #     be rescaled by its own positive factor -- raw categorical e_j carry no meaning;
-    #   * numeric: e_j -> e_j + a for all numeric j and e_b -> e_b - a for all bins (one shared
-    #     shift), plus one global scale;
-    #   * all encodings: one global rotation (absorbed by the first GAT layer).
-    # The helpers below return representations that are invariant to all shifts and rescalings
-    # (only defined up to the global rotation, which leaves cosines/distances unchanged).
+    # All embeddings are defined up to one global rotation (absorbed by the first GAT layer):
+    # cosines and distances are well defined, raw coordinates of different runs must be aligned
+    # (e.g. Procrustes) before being compared.
 
     def _check_fitted(self):
         if not hasattr(self, '_all_embeddings'):
@@ -295,82 +257,21 @@ class Embedder(BaseEstimator, ClassifierMixin):
         h0 = W[n2e[:, 0]] + W[n2e[:, 1]]
         return h0 / h0.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
 
-    def _value_nodes_per_variable(self, model=None):
-        """Map variable name -> LongTensor of its value-node ids in the graph."""
-        model = self.model if model is None else model
-        n2e = model.node_to_embeddings.cpu()
-        var_rows = model.variable_embeddings_ids.cpu().tolist()
-        num_samples = len(self._sample_node_dict)
-        is_value = torch.arange(n2e.size(0)) >= num_samples
-        return {var: torch.nonzero(is_value & (n2e[:, 0] == row)).flatten()
-                for var, row in zip(self._variable_names, var_rows)}
+    def _used_bin_mask(self, model=None):
+        """Bool mask over the continuous-bin rows: True for bins used by a numeric value node.
 
-    def _variable_centroids(self, model=None):
-        """Per variable: mean of its normalized value-node inputs h0 (and the centroid norms)."""
-        h0 = self._value_node_inputs(model)
-        nodes = self._value_nodes_per_variable(model)
-        cen = torch.full((len(self._variable_names), h0.size(1)), float('nan'))
-        for k, var in enumerate(self._variable_names):
-            if nodes[var].numel():
-                cen[k] = h0[nodes[var]].mean(dim=0)
-        return cen.numpy(), cen.norm(p=2, dim=1).numpy()
-
-    @torch.no_grad()
-    def _numeric_concepts_and_bins(self, model=None):
-        """Numeric variable encodings and bin encodings with the shared shift and scale removed.
-
-        Numeric e_j are centred over numeric variables, bin encodings e_b over the bins used by
-        at least one numeric value node (unused bins receive no gradient and stay NaN). Both are
-        divided by the same factor (mean norm of the centred numeric e_j) to remove the global
-        scale. Returns (numeric_variable_names, concept_matrix, bin_matrix).
+        Bins that no value node uses keep their (random) placeholder row and are reported as NaN.
         """
         model = self.model if model is None else model
-        W = model.node_embeddings.weight.detach().cpu()
         n2e = model.node_to_embeddings.cpu()
-        var_rows = dict(zip(self._variable_names, model.variable_embeddings_ids.cpu().tolist()))
-        num_vars = [v for v in self._variable_names if v in self._cont_vars]
         bin_rows = model.bin_embedding_ids.cpu().long()
-        d = W.size(1)
-        if not num_vars:
-            return [], np.zeros((0, d)), np.full((len(bin_rows), d), np.nan)
-        concepts = W[[var_rows[v] for v in num_vars]]
-        concepts = concepts - concepts.mean(dim=0, keepdim=True)
-        num_var_rows = torch.tensor([var_rows[v] for v in num_vars])
-        num_samples = len(self._sample_node_dict)
-        value_rows = n2e[num_samples:]
-        used = torch.isin(bin_rows, value_rows[torch.isin(value_rows[:, 0], num_var_rows), 1])
-        bins = torch.full((len(bin_rows), d), float('nan'), dtype=W.dtype)
-        if used.any():
-            used_bins = W[bin_rows[used]]
-            bins[used] = used_bins - used_bins.mean(dim=0, keepdim=True)
-        scale = concepts.norm(p=2, dim=1).mean()
-        if scale > 0:
-            concepts, bins = concepts / scale, bins / scale
-        return num_vars, concepts.numpy(), bins.numpy()
+        value_rows = n2e[len(self._sample_node_dict):]
+        return torch.isin(bin_rows, value_rows[:, 1])
 
-    def get_variable_centroid_norms(self):
-        """Norm of each variable's centroid representation (see `get_embeddings`).
-
-        A centroid norm close to zero means the variable's value nodes point in nearly opposite
-        directions; cosine similarities involving that variable are then numerically unstable.
-        """
-        self._check_fitted()
-        _, norms = self._variable_centroids()
-        return pd.Series(norms, index=self._variable_names, name="centroid_norm")
-
-    def get_numeric_concept_embeddings(self):
-        """Learned shared-concept encodings e_j of the numeric variables.
-
-        Because bin encodings are shared across all numeric variables, these are identified by the
-        training objective up to one common shift, one global scale and a global rotation; the
-        returned vectors are centred and scale-normalized, so differences e_j - e_j' (and cosines
-        / distances between them) are well defined. Categorical variables have no identifiable
-        encoding of this kind and are not included.
-        """
-        self._check_fitted()
-        names, concepts, _ = self._numeric_concepts_and_bins()
-        cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
-        return pd.DataFrame(concepts, index=names, columns=cols)
+    def _bin_matrix(self, bins, model=None):
+        bins = torch.as_tensor(bins).detach().cpu().clone()
+        bins[~self._used_bin_mask(model)] = float('nan')
+        return bins.numpy()
 
     def get_value_node_embeddings(self, level="input"):
         """Embeddings of all value nodes (categories and numeric bins), indexed "variable=value".
@@ -378,7 +279,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         Args:
             level (str): "input" for the normalized initial features normalize(e_j + e_c) fed into
                 the GAT encoder, "latent" for the encoder outputs z (same space as the sample
-                embeddings). Both are invariant to the encoding shifts/rescalings.
+                embeddings).
         """
         self._check_fitted()
         if level == "input":
@@ -392,41 +293,19 @@ class Embedder(BaseEstimator, ClassifierMixin):
         cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
         return pd.DataFrame(matrix[rows].numpy(), index=labels, columns=cols)
 
-    def _value_rows_fixed(self):
-        """True if the value encodings (categories, bins, NA codes) are frozen (anchor_weight=inf).
-
-        Then e_j + e_v has no shift/rescale ambiguity and the raw variable encodings e_j are
-        identifiable (up to the global rotation shared by all embeddings).
-        """
-        return self.anchor_weight == float("inf")
-
-    def get_embeddings(self, raw=False):
+    def get_embeddings(self):
         """Extract the computed embeddings.
 
-        Args:
-            raw (bool): If False (default), variable embeddings are the learned encodings e_j when
-                the value encodings are frozen (anchor_weight=inf, the default since 1.3; e_j is
-                then identifiable), and otherwise the mean of each variable's normalized
-                value-node inputs (invariant to the encoding shifts/rescalings of a fully
-                learnable table); bin embeddings are centred and scale-normalized. If True,
-                return the raw stored encodings e_j / e_b as in POME <= 1.1 -- with a learnable
-                table these are NOT identifiable (see class comments).
-
         Returns:
-            (sample_df, variable_df, bin_df, sample_to_attention_index). All embeddings are
+            (sample_df, variable_df, bin_df, sample_to_attention_index). sample_df holds the GAT
+            outputs of the samples, variable_df the learned variable encodings e_j and bin_df
+            the (fixed) continuous-bin encodings e_b (NaN for bins no value node uses). All are
             defined up to a global rotation; use cosine/Euclidean geometry, or align runs (e.g.
             Procrustes) before comparing raw coordinates across runs.
         """
         self._check_fitted()
-        if raw:
-            variable_matrix = self._variable_embeddings
-            bin_matrix = self._bin_embeddings
-        else:
-            if self._value_rows_fixed():
-                variable_matrix = self._variable_embeddings
-            else:
-                variable_matrix, _ = self._variable_centroids()
-            _, _, bin_matrix = self._numeric_concepts_and_bins()
+        variable_matrix = self._variable_embeddings
+        bin_matrix = self._bin_matrix(self._bin_embeddings)
         sample_rows = list(self._sample_node_dict.values())
         sample_to_attention_index = {sample: row for row, sample in enumerate(self._sample_node_dict.keys())}
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
@@ -712,12 +591,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
     def _fit_value_regressor(self):
         """Train the regression head on the frozen embeddings for numeric imputation.
 
-        The head maps ``concat(sample_feature, variable_feature) -> standardized value``. With
-        ``regressor_inputs="invariant"`` (default) the sample feature is the sample node's
-        normalized input feature (the model's own input, taken before the GAT encoder) and the
-        variable feature is the numeric concept encoding (see ``get_numeric_concept_embeddings``);
-        both are invariant to the encoding-table reparametrizations that leave the model
-        unchanged. ``"raw"`` uses the raw learned encodings instead (POME <= 1.1). Sample features
+        The head maps ``concat(sample_feature, variable_feature) -> standardized value``. The
+        sample feature is the sample node's encoding (the model's own input, taken before the GAT
+        encoder), the variable feature the learned variable encoding e_j. Sample features
         are variable-independent, so a single cached matrix (``_sample_encodings``) serves both
         training and inference and the features are identically distributed at both times.
         Training is full-batch with an L1 loss and is deterministic under the global seed.
@@ -739,16 +615,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
             c1 = self.model.node_embeddings(self.model.node_to_embeddings[:, 0].to(device))
             c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
             training_embeds = c1 + c2
-            if self.regressor_inputs == "invariant":
-                training_embeds = training_embeds / training_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
-                names, concepts, _ = self._numeric_concepts_and_bins()
-                self._reg_variable_features = {
-                    v: torch.tensor(concepts[k], dtype=training_embeds.dtype)
-                    for k, v in enumerate(names)}
-            else:
-                self._reg_variable_features = {
-                    v: self._variable_embeddings[k].detach().cpu()
-                    for k, v in enumerate(self._variable_names) if v in self._cont_vars}
+            self._reg_variable_features = {
+                v: torch.as_tensor(self._variable_embeddings[k]).detach().cpu()
+                for k, v in enumerate(self._variable_names) if v in self._cont_vars}
 
             # Pre-encoder sample features are variable-independent; cache once for inference.
             self._sample_encodings = training_embeds[sample_node_idx].detach().to('cpu')
@@ -808,10 +677,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         de-standardizes the head's output with the variable's stored (mean, std).
         """
         sample_emb = self._sample_encodings[self._reg_sample_order[sample]].unsqueeze(0)
-        if hasattr(self, "_reg_variable_features"):
-            var_emb = self._reg_variable_features[variable].unsqueeze(0)
-        else:  # embedder pickled with POME <= 1.1
-            var_emb = self._variable_embeddings[self._variable_names.index(variable)].unsqueeze(0)
+        var_emb = self._reg_variable_features[variable].unsqueeze(0)
         with torch.no_grad():
             std_pred = self._value_regressor(sample_emb, var_emb).item()
         mean, std = self._reg_target_stats[variable]
@@ -951,8 +817,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
             informative_nas=self.informative_nas,
             discretization_type=self.discretization_type,
             negatives=self.negatives,
-            init=self.init,
-            anchor_weight=self.anchor_weight,
+            variable_anchor_weight=self.variable_anchor_weight,
             gram_anchor_weight=self.gram_anchor_weight,
             gram_reference_components=self.gram_reference_components,
             inductive=False,
@@ -1137,13 +1002,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                 pos_neg_similarities, latent = pos_neg_similarities
             loss = F.binary_cross_entropy(pos_neg_similarities, tensors["labels"])
 
-        # Optional anchoring of the encoding table to its initialization.
-        anchor = getattr(autoencoder, "anchor_table", None)
-        if anchor is not None:
-            drift = autoencoder.node_embeddings.weight - anchor
-            loss = loss + self.anchor_weight * drift.pow(2).sum(dim=1).mean()
-
-        # Optional anchoring of trainable variable rows to their initialization.
+        # Anchoring of the trainable variable rows e_j to their initialization.
         var_anchor = getattr(autoencoder, "variable_anchor", None)
         if var_anchor is not None:
             ids = autoencoder.variable_embeddings_ids.to(var_anchor.device)
@@ -1166,31 +1025,23 @@ class Embedder(BaseEstimator, ClassifierMixin):
 
     @torch.no_grad()
     def _initialize_encodings(self, model, graph_data):
-        """Set the initial encoding table (spectral if requested) and the anchoring setup."""
+        """Set the spectral encoding table, freeze its sample/value rows and set up the anchors."""
         weight = model.node_embeddings.weight
-        if self.init == "spectral":
-            table = spectral_encoding_table(
-                graph_data.unique_edges, graph_data.num_samples, graph_data.num_nodes,
-                model.node_to_embeddings, weight)
-            weight.copy_(table.to(weight.device))
-        if self.anchor_weight == float("inf"):
-            if self.train_variable_encodings:
-                # Only variable rows receive gradients (mask applied in _train_epoch). Adam has no
-                # weight decay here, so rows with zero gradient stay exactly at their init.
-                mask = torch.zeros(weight.shape[0], 1, device=weight.device)
-                mask[model.variable_embeddings_ids.to(weight.device)] = 1.0
-                model.register_buffer("encoding_grad_mask", mask)
-                if 0 < self.variable_anchor_weight < float("inf"):
-                    model.register_buffer("variable_anchor",
-                                          weight[model.variable_embeddings_ids.to(weight.device)]
-                                          .detach().clone())
-                elif self.variable_anchor_weight == float("inf"):
-                    del model.encoding_grad_mask
-                    weight.requires_grad_(False)
-            else:
-                weight.requires_grad_(False)
-        elif self.anchor_weight > 0:
-            model.register_buffer("anchor_table", weight.detach().clone())
+        table = spectral_encoding_table(
+            graph_data.unique_edges, graph_data.num_samples, graph_data.num_nodes,
+            model.node_to_embeddings, weight)
+        weight.copy_(table.to(weight.device))
+        var_ids = model.variable_embeddings_ids.to(weight.device)
+        if self.variable_anchor_weight == float("inf"):
+            weight.requires_grad_(False)
+        else:
+            # Only variable rows receive gradients (mask applied in _train_epoch). Adam has no
+            # weight decay here, so rows with zero gradient stay exactly at their init.
+            mask = torch.zeros(weight.shape[0], 1, device=weight.device)
+            mask[var_ids] = 1.0
+            model.register_buffer("encoding_grad_mask", mask)
+            if self.variable_anchor_weight > 0:
+                model.register_buffer("variable_anchor", weight[var_ids].detach().clone())
         if self.gram_anchor_weight > 0:
             reference = spectral_sample_embedding(
                 graph_data.unique_edges, graph_data.num_samples, graph_data.num_nodes,
@@ -1270,13 +1121,10 @@ class Embedder(BaseEstimator, ClassifierMixin):
         node_embeddings, _, _ = autoencoder.get_embeddings(graph_data.edge_index)
         if was_training:
             autoencoder.train()
-        # Same (identifiable) variable/bin representations as get_embeddings(raw=False).
-        if self._value_rows_fixed():
-            variable_matrix = autoencoder.node_embeddings.weight.detach().cpu()[
-                autoencoder.variable_embeddings_ids.cpu()].numpy()
-        else:
-            variable_matrix, _ = self._variable_centroids(autoencoder)
-        _, _, bin_matrix = self._numeric_concepts_and_bins(autoencoder)
+        # Same variable/bin representations as get_embeddings().
+        W = autoencoder.node_embeddings.weight.detach().cpu()
+        variable_matrix = W[autoencoder.variable_embeddings_ids.cpu()].numpy()
+        bin_matrix = self._bin_matrix(W[autoencoder.bin_embedding_ids.cpu().long()], autoencoder)
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
 

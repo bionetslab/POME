@@ -76,11 +76,8 @@ POME's Embedder class allows for the specification of the following parameters:
 - `device : str = "cpu"`: Specifies whether to train on CPU ("cpu") or GPU ("cuda").
 
 ### Training stability
-Since v1.3 POME trains with settings that make repeated runs (different seeds) yield nearly identical embeddings: the encoding table is initialized from the spectral embedding of the bipartite sample-value graph, the sample and value rows are kept frozen, the variable encodings e_j are learned but anchored to their spectral initialization, the output geometry is anchored to its leading spectral components, and the learning rate decays to zero. Set `train_variable_encodings=False` for a fully frozen table, and `init="random", anchor_weight=0, gram_anchor_weight=0, lr_schedule="constant"` to reproduce POME ≤ 1.2.
-- `init : str = "spectral"`: Initialization of the encoding table - `"spectral"` (deterministic, from a degree-normalized SVD of the sample-value graph) or `"random"` (POME ≤ 1.2).
-- `anchor_weight : float = inf`: Penalty keeping the encoding table close to its initialization; `float("inf")` freezes the table, `0` lets it be learned freely.
-- `train_variable_encodings : bool = True`: With a frozen table (`anchor_weight=inf`), keep the variable encodings e_j trainable while sample and value rows stay fixed. Because the value rows are fixed, the learned e_j are identifiable and can be compared directly (no shift/rescale ambiguity).
-- `variable_anchor_weight : float = 0.1`: Penalty `w * mean_j ||e_j - e_j_init||^2` keeping the learned e_j near their spectral initialization; `0` learns them freely (not reproducible across seeds), `inf` freezes them.
+POME trains so that repeated runs (different seeds) yield nearly identical embeddings. The encoding table is initialized from the spectral embedding of the bipartite sample-value graph (deterministic, from a degree-normalized SVD), and its sample and value rows stay fixed at this initialization. The variable encodings e_j are learned but anchored to their spectral initialization. The output geometry is anchored to its leading spectral components, and the learning rate decays to zero.
+- `variable_anchor_weight : float = 0.1`: Penalty `w * mean_j ||e_j - e_j_init||^2` keeping the learned variable encodings e_j near their spectral initialization; `0` learns them freely (not reproducible across seeds), `float("inf")` keeps them fixed.
 - `gram_anchor_weight : float = 10.0`: Weight of the penalty pulling the pairwise cosine similarities of the sample embeddings towards those of the spectral reference; `0` disables it.
 - `gram_reference_components : int = 8`: Number of leading spectral components forming that reference (`None` = all `embedding_dimension` components). Few components keep the dominant group structure and thus cluster separation.
 - `lr_schedule : str = "cosine"`: Learning-rate schedule - `"cosine"` or `"linear"` decay to zero, or `"constant"` (POME ≤ 1.2).
@@ -94,7 +91,6 @@ Since v1.3 POME trains with settings that make repeated runs (different seeds) y
 
 ### Imputation
 - `enable_imputation : bool = False`: Set this to true if you want to use POME for imputation after training. It has to be set at construction time.
-- `regressor_inputs : str = "invariant"`: Inputs of the regression head used for numeric imputation. `"invariant"` uses the sample node's normalized input feature and the numeric concept encoding of the variable (see the note on variable encodings below); `"raw"` uses the raw learned encodings (behaviour of POME ≤ 1.1).
 
 ### Inductive epoch tuning
 With `inductive=True`, `fit()` does not train for a fixed number of epochs. It first runs a cross-validation that holds out whole samples and picks the epoch count that best generalizes to unseen ones, using a label-free train-vs-held-out effective-rank gap as the stopping signal. The selected value is stored in `_optimal_epochs`, while `epochs` serves as the upper cap and is restored after fitting.
@@ -113,25 +109,15 @@ All of these are disabled by default and add no cost to the training loop when u
 After initializing the Embedder object, the main functions for using POME are:
 
 - `fit(X, y=None)`: Training POME on the given input dataframe, with the input format as specified above.
-- `get_embeddings(raw=False)`: Return computed embeddings in dataframe format. Output is a four-tuple of sample embeddings (position 0), variable embeddings (position 1), continuous-bin embeddings (position 2), and a mapping from sample name to its row in the attention matrix (position 3). Variable embeddings are the learned variable encodings e_j when the value encodings are frozen (`anchor_weight=inf`, the default), and otherwise the mean of each variable's normalized value-node inputs (same definition for numeric and categorical variables); bin embeddings are centred and scale-normalized. `raw=True` returns the raw stored encodings in every case (behaviour of POME ≤ 1.1) — see the note below before using them with a learnable table.
+- `get_embeddings()`: Return computed embeddings in dataframe format. Output is a four-tuple of sample embeddings (position 0), variable embeddings (position 1), continuous-bin embeddings (position 2), and a mapping from sample name to its row in the attention matrix (position 3). Variable embeddings are the learned variable encodings e_j, bin embeddings the (fixed) bin encodings e_b; bins that no value node uses are NaN. See the note below.
 - `get_value_node_embeddings(level="input")`: Embeddings of all value nodes (categories and numeric bins), indexed `"variable=value"`. `level="input"` gives the normalized initial features fed into the encoder, `level="latent"` the encoder outputs (same space as the sample embeddings).
-- `get_numeric_concept_embeddings()`: Learned shared-concept encodings of the numeric variables, centred and scale-normalized.
-- `get_variable_centroid_norms()`: Norm of each variable's value-node centroid. Values close to zero mean that the variable's value nodes point in nearly opposite directions, so cosine similarities involving that variable are unstable.
 - `transform(X)`: Embed new, unseen samples with the frozen trained encoder, without retraining. `X` must contain exactly the same variables as the training data plus the type column, and every sample must share at least one observed, known value with the training data — a sample whose values are all missing or unseen carries no signal and raises. Returns a `(num_new_samples, embedding_dimension)` dataframe.
-- `impute_all(na_value : float)`: Imputes all missing values specified by `na_value` in the input dataset, and directly returns the imputed dataframe. Categorical values are imputed by scoring candidate values with the trained decoder, continuous ones by a regression head trained on the frozen embeddings. Requires `enable_imputation=True`.
+- `impute_all(na_value : float)`: Imputes all missing values specified by `na_value` in the input dataset, and directly returns the imputed dataframe. Categorical values are imputed by scoring candidate values with the trained decoder, continuous ones by a regression head on the sample encoding and the learned variable encoding e_j. Requires `enable_imputation=True`.
 
 
 ### Note on variable encodings
 
-The input feature of a value node is the normalized sum of a variable encoding and a value encoding (`e_j + e_c` for categories, `e_j + e_b` for numeric bins). The model only ever sees these normalized sums, so the individual learned encodings are not uniquely determined:
-
-- For categorical variables, `e_j` can be shifted against its category encodings (and each sum rescaled) without changing the model. Raw categorical variable encodings therefore carry no meaning on their own.
-- For numeric variables, bin encodings are shared across variables, which pins down the `e_j` up to one common shift and one global scale. `get_numeric_concept_embeddings()` removes both.
-- All embeddings, including the sample embeddings, are only defined up to a global rotation. Cosine similarities and distances are unaffected, but raw coordinates of different runs should be aligned (e.g. by Procrustes) before being compared.
-
-The default outputs of `get_embeddings()` and the other getters above are invariant to all of these ambiguities except the rotation.
-
-With the default settings the value encodings `e_c` / `e_b` are frozen at their spectral initialization, which removes the shift and rescale ambiguities: the learned `e_j` are then identifiable and `get_embeddings()` returns them directly. The centroid representation above is used only when the table is learnable (`anchor_weight < inf`).
+The input feature of a value node is the normalized sum of a variable encoding and a value encoding (`e_j + e_c` for categories, `e_j + e_b` for numeric bins). The value encodings `e_c` / `e_b` are fixed at their spectral initialization and only `e_j` is learned, so the learned `e_j` are uniquely determined by the training objective and can be compared directly, e.g. via cosine similarity. As for all embeddings, they are only defined up to a global rotation: cosine similarities and distances are unaffected, but raw coordinates of different runs should be aligned (e.g. by Procrustes) before being compared.
 
 
 ## License
