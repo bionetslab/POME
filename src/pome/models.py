@@ -106,23 +106,28 @@ class GraphAutoencoder(nn.Module):
         self.variable_embeddings_ids = variable_embeddings_ids
         self.bin_embedding_ids = bin_embedding_ids
 
-    def forward(self, graph_edges, pos_neg_edges):
+    def forward(self, graph_edges, pos_neg_edges, return_latent=False):
         # Retrieve actual node embeddings as sum of corresponding variable- and value-level embeddings.
         component_1_embeddings = self.node_embeddings(self.node_to_embeddings[:, 0]) 
         component_2_embeddings = self.node_embeddings(self.node_to_embeddings[:, 1])
         node_embeds = component_1_embeddings + component_2_embeddings
         
-        # Normalize node embeddings.
-        # node_embeds = self.node_embeddings.weight  # [num_nodes, embedding_dim]
-        node_embeds = node_embeds / node_embeds.norm(p=2, dim=1, keepdim=True)
+        # Normalize node embeddings (clamped: a sample whose values are all masked has an all-zero
+        # spectral input row; rows with non-zero norm are unchanged).
+        node_embeds = node_embeds / node_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
 
         # Encode to latent embeddings using GAT and normalize again.
         latent_embeds = self.encoder(node_embeds, graph_edges)
-        latent_embeds = latent_embeds / latent_embeds.norm(p=2, dim=1, keepdim=True)
+        # Clamp as in Embedder._frozen_encode: a node whose whole neighbourhood is dead after the
+        # hidden ReLU gets an exactly-zero GAT output (possible at init, e.g. with spectral
+        # inputs at small d) and must not turn into NaN. Rows with non-zero norm are unchanged.
+        latent_embeds = latent_embeds / latent_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
 
         # Decode predicted link probabilities for positive and negative edges.
         link_preds = self.decoder(latent_embeds, pos_neg_edges)
 
+        if return_latent:
+            return link_preds, latent_embeds
         return link_preds
 
     @torch.no_grad()
@@ -135,12 +140,12 @@ class GraphAutoencoder(nn.Module):
         node_embeds = component_1_embeddings + component_2_embeddings
         
         #node_embeds = self.node_embeddings.weight
-        node_embeds = node_embeds / node_embeds.norm(p=2, dim=1, keepdim=True)
+        node_embeds = node_embeds / node_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
 
         latent_embeds = self.encoder(node_embeds, graph_edges)
 
         if normalize:
-            latent_embeds = latent_embeds / latent_embeds.norm(p=2, dim=1, keepdim=True)
+            latent_embeds = latent_embeds / latent_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
 
         # Additionally extract variable embeddings (does not need encoder pass).
         variable_embeddings = self.node_embeddings(self.variable_embeddings_ids)

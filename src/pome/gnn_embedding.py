@@ -11,7 +11,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import KFold
 import joblib
 from pome.models import GraphAutoencoder, ValueRegressor
-from pome.utils import compute_roc, matched_overfit_index, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
+from pome.utils import spectral_encoding_table, spectral_sample_embedding, spectral_nystrom_projection, gram_discrepancy, compute_roc, matched_overfit_index, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
@@ -49,6 +49,12 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  regressor_lr : float = None,
                  regressor_weight_decay : float = 1e-4,
                  regressor_inputs : str = "invariant",
+                 lr_schedule : str = "constant",
+                 negatives : str = "sampled",
+                 init : str = "random",
+                 anchor_weight : float = 0.0,
+                 gram_anchor_weight : float = 0.0,
+                 gram_reference_components : int = None,
                  inductive : bool = False,
                  cv_folds : int = 3,
                  cv_eval_every : int = 10,
@@ -97,6 +103,58 @@ class Embedder(BaseEstimator, ClassifierMixin):
         if regressor_inputs not in ("invariant", "raw"):
             raise ValueError("regressor_inputs must be 'invariant' or 'raw'.")
         self.regressor_inputs = regressor_inputs
+        # Learning-rate schedule of the GNN training. "constant" (default, POME <= 1.2): Adam at
+        # `lr` for all epochs. "cosine" / "linear": decay from `lr` to 0 over the trained epochs,
+        # so the parameters settle instead of ending at a random point of the optimizer's noise
+        # ball. Applies to the final training run only; the inductive epoch-tuning CV always uses
+        # a constant lr, since its folds run to the cap and their stopping epoch is not known in
+        # advance.
+        if lr_schedule not in ("constant", "cosine", "linear"):
+            raise ValueError("lr_schedule must be 'constant', 'cosine' or 'linear'.")
+        self.lr_schedule = lr_schedule
+        # Negatives of the link-prediction loss. "sampled" (default, POME <= 1.2): per positive
+        # sample-variable pair, one random alternative value of that variable per epoch. "all":
+        # score every alternative value of the pair each epoch, each weighted 1/(#alternatives),
+        # which is exactly the expectation of the sampled loss -- the loss becomes deterministic.
+        if negatives not in ("sampled", "all"):
+            raise ValueError("negatives must be 'sampled' or 'all'.")
+        self.negatives = negatives
+        # Initialization of the encoding table. "random" (default, POME <= 1.2): Xavier-uniform rows
+        # scaled to unit length. "spectral": sample rows and value-node inputs start at the
+        # spectral embedding (degree-normalized SVD) of the bipartite sample-value graph; the
+        # shared variable / value rows are fitted to it by least squares (see
+        # utils.spectral_encoding_table). Deterministic given the data; only the GAT and decoder
+        # weights remain randomly initialized.
+        if init not in ("random", "spectral"):
+            raise ValueError("init must be 'random' or 'spectral'.")
+        self.init = init
+        # Anchoring of the encoding table to its initialization: adds
+        # anchor_weight * mean_rows ||W - W_init||^2 to the link-prediction loss, so training stays
+        # near the (deterministic) spectral solution instead of drifting away from it. 0 disables it
+        # (default); float("inf") freezes the table entirely (only GAT and decoder are trained).
+        # Meant for init="spectral"; with init="random" it anchors to the random draw.
+        if not anchor_weight >= 0:
+            raise ValueError("anchor_weight must be >= 0 (or float('inf')).")
+        self.anchor_weight = float(anchor_weight)
+        # Output Gram anchor: adds gram_anchor_weight * mean_ij (z_i.z_j - x_i.x_j)^2 over the
+        # training samples, where z_i are the (unit-length) GAT outputs and x_i the unit-length
+        # spectral sample coordinates (utils.spectral_sample_embedding). It pins the sample-sample
+        # cosine geometry of the output -- the quantity downstream clustering / kNN / probes see --
+        # to a deterministic reference, while leaving rotations of the output free. Works with
+        # either init; 0 disables it (default).
+        if not (gram_anchor_weight >= 0 and np.isfinite(gram_anchor_weight)):
+            raise ValueError("gram_anchor_weight must be a finite number >= 0.")
+        self.gram_anchor_weight = float(gram_anchor_weight)
+        # Number k of leading non-trivial spectral components forming the Gram reference x_i
+        # (None = all embedding_dimension components). A small k keeps only the dominant,
+        # cluster-level structure of the spectral embedding; with all d components the reference
+        # spreads the sample variance over many weak directions and dilutes cluster separation.
+        if gram_reference_components is not None and not (
+                isinstance(gram_reference_components, (int, np.integer))
+                and gram_reference_components >= 1):
+            raise ValueError("gram_reference_components must be None or an int >= 1.")
+        self.gram_reference_components = (None if gram_reference_components is None
+                                          else int(gram_reference_components))
         # Inductive epoch tuning: when enabled, fit() first runs a sample-holdout CV to pick the
         # number of epochs that best generalizes to unseen samples, then trains on all samples for
         # that many epochs. The stopping signal is the label-free sample-matched, ceiling-normalized
@@ -217,7 +275,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         W = model.node_embeddings.weight.detach().cpu()
         n2e = model.node_to_embeddings.cpu()
         h0 = W[n2e[:, 0]] + W[n2e[:, 1]]
-        return h0 / h0.norm(p=2, dim=1, keepdim=True)
+        return h0 / h0.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
 
     def _value_nodes_per_variable(self, model=None):
         """Map variable name -> LongTensor of its value-node ids in the graph."""
@@ -533,7 +591,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         norms = latent.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
         return latent / norms
 
-    def transform(self, X):
+    def transform(self, X, sample_input="zero"):
         """Generate embeddings for new, unseen samples using the frozen trained encoder.
 
         The trained model weights are never updated (no retraining). Each new sample is added
@@ -554,9 +612,18 @@ class Embedder(BaseEstimator, ClassifierMixin):
         Every sample must share at least one observed, in-vocabulary value with the training
         data; an edgeless sample (all values missing / unseen) has no signal and raises.
 
+        With a spectral encoding table (``init="spectral"``) a training sample's own input row
+        is its spectral coordinate, while the zero row of a new sample has no counterpart in
+        training. ``sample_input="nystrom"`` instead gives each new sample the Nystrom extension
+        of the spectral sample coordinates, computed from the value nodes it observes (see
+        ``utils.spectral_nystrom_projection``); for a training sample this reproduces its own
+        input row.
+
         Args:
             X (pd.DataFrame): New samples in the same format as the training data
                               (rows=variables, columns=new_samples+type_column).
+            sample_input (str): input row of the new sample nodes, ``"zero"`` (default) or
+                                ``"nystrom"`` (requires ``init="spectral"``).
 
         Returns:
             pd.DataFrame: Embedding matrix with shape (num_new_samples, embedding_dimension),
@@ -564,6 +631,10 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """
         if not hasattr(self, '_graph_data'):
             raise ValueError("Run fit() first before calling transform()!")
+        if sample_input not in ("zero", "nystrom"):
+            raise ValueError("sample_input must be 'zero' or 'nystrom'.")
+        if sample_input == "nystrom" and getattr(self, "init", "random") != "spectral":
+            raise ValueError("sample_input='nystrom' requires a model fitted with init='spectral'.")
 
         input_data = X.copy()
         new_samples = [c for c in input_data.columns if c != self.type_column]
@@ -593,7 +664,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
 
         self.model.eval()
         with torch.no_grad():
-            latent, num_existing_nodes = self._inductive_forward(pairs_per_sample)
+            latent, num_existing_nodes = self._inductive_forward(pairs_per_sample, sample_input)
             new_latent = latent[num_existing_nodes:].cpu()
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
@@ -652,7 +723,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
             c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
             training_embeds = c1 + c2
             if self.regressor_inputs == "invariant":
-                training_embeds = training_embeds / training_embeds.norm(p=2, dim=1, keepdim=True)
+                training_embeds = training_embeds / training_embeds.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
                 names, concepts, _ = self._numeric_concepts_and_bins()
                 self._reg_variable_features = {
                     v: torch.tensor(concepts[k], dtype=training_embeds.dtype)
@@ -728,7 +799,23 @@ class Embedder(BaseEstimator, ClassifierMixin):
             std_pred = self._value_regressor(sample_emb, var_emb).item()
         mean, std = self._reg_target_stats[variable]
         return std_pred * std + mean
-    def _inductive_forward(self, pairs_per_sample):
+    def _nystrom_sample_inputs(self, pairs_per_sample):
+        """Nystrom-extended spectral input rows (unit length) for new samples, [n_new, d]."""
+        d = self.model.node_embeddings.weight.shape[1]
+        if getattr(self, "_nystrom_projection", None) is None:
+            g = self._graph_data
+            self._nystrom_projection = spectral_nystrom_projection(
+                g.unique_edges, g.num_samples, g.num_nodes, d)
+        P = self._nystrom_projection
+        num_samples = self._graph_data.num_samples
+        out = np.zeros((len(pairs_per_sample), d))
+        for i, pairs in enumerate(pairs_per_sample):
+            values = sorted({node for _, node in pairs})
+            out[i, :P.shape[1]] = P[np.asarray(values) - num_samples].sum(axis=0)
+        norm = np.linalg.norm(out, axis=1, keepdims=True)
+        return torch.tensor(out / np.maximum(norm, 1e-12), dtype=torch.float32)
+
+    def _inductive_forward(self, pairs_per_sample, sample_input="zero"):
         """Inject new sample nodes into the frozen training graph and encode all nodes in one pass.
 
         Builds the augmented input feature matrix (frozen training-node embeddings, i.e.
@@ -752,9 +839,13 @@ class Embedder(BaseEstimator, ClassifierMixin):
         c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
         training_embeds = c1 + c2
 
-        new_sample_embeds = torch.zeros(
-            len(pairs_per_sample), self.embedding_dimension,
-            device=device, dtype=training_embeds.dtype)
+        if sample_input == "nystrom":
+            new_sample_embeds = self._nystrom_sample_inputs(pairs_per_sample).to(
+                device=device, dtype=training_embeds.dtype)
+        else:
+            new_sample_embeds = torch.zeros(
+                len(pairs_per_sample), self.embedding_dimension,
+                device=device, dtype=training_embeds.dtype)
         augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
         augmented_edge_index = self._augmented_edge_index(
             pairs_per_sample, num_existing_nodes, device)
@@ -814,8 +905,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
             for ctx in contexts:
                 self._train_epoch(
                     ctx["model"], ctx["optimizer"], ctx["graph_data"],
-                    ctx["neg_edges_tensor"], ctx["all_rand_indices"],
-                    ctx["combined_labels"], ctx["B"], e)
+                    ctx["train_tensors"], e)
 
             if (e + 1) % self.cv_eval_every == 0:
                 gaps = [self._cv_overfit_index_fold(ctx) for ctx in contexts]
@@ -863,6 +953,11 @@ class Embedder(BaseEstimator, ClassifierMixin):
             na_encoding=self.non_informative_na,
             informative_nas=self.informative_nas,
             discretization_type=self.discretization_type,
+            negatives=self.negatives,
+            init=self.init,
+            anchor_weight=self.anchor_weight,
+            gram_anchor_weight=self.gram_anchor_weight,
+            gram_reference_components=self.gram_reference_components,
             inductive=False,
         )
 
@@ -893,13 +988,14 @@ class Embedder(BaseEstimator, ClassifierMixin):
             node_to_embeddings_index=graph_data.node_to_embeddings,
             variable_embeddings_ids=variable_embedding_ids,
             bin_embedding_ids=cont_bin_embedding_ids).to(self.device)
+        self._initialize_encodings(fold.model, graph_data)
         fold._graph_data = graph_data
         optimizer = torch.optim.Adam(fold.model.parameters(), lr=self.lr)
 
         # Pre-sample negatives from a fold-local RNG so CV does not disturb the global RNG stream.
         generator = torch.Generator(device=self.device)
         generator.manual_seed(self.cv_seed + fold_idx)
-        neg_edges_tensor, all_rand_indices, combined_labels, B = self._prepare_training_tensors(
+        train_tensors = self._prepare_training_tensors(
             neg_edges_per_pair, graph_data, self.epochs, generator=generator)
 
         # Precompute held-out validation edges against the fold's value vocabulary. Offsets must match
@@ -934,10 +1030,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
             "model": fold.model,
             "optimizer": optimizer,
             "graph_data": graph_data,
-            "neg_edges_tensor": neg_edges_tensor,
-            "all_rand_indices": all_rand_indices,
-            "combined_labels": combined_labels,
-            "B": B,
+            "train_tensors": train_tensors,
             "pairs_per_sample": pairs_per_sample,
             "pos_edge_index": pos_edge_index,
             "neg_edge_index": neg_edge_index,
@@ -981,40 +1074,82 @@ class Embedder(BaseEstimator, ClassifierMixin):
         self.device in place. When `generator` is given, negative index sampling draws from it instead
         of the global RNG (used by CV to stay reproducible and not disturb the final training's RNG).
 
+        With ``negatives="sampled"`` one negative per positive pair is drawn per epoch (indices
+        pre-sampled for all epochs). With ``negatives="all"`` every alternative value of each pair is
+        scored every epoch, weighted 1/(#alternatives of the pair), and the loss is normalized by
+        (#positives + #pairs) -- exactly the expectation of the sampled loss, but deterministic.
+
         Returns:
-            (neg_edges_tensor, all_rand_indices, combined_labels, B)
+            dict of training tensors consumed by ``_train_epoch``.
         """
         neg_edges_list = [val for _, val in neg_edges_per_pair.items() if val.numel() > 0]
-        neg_edges_tensor = repeat_pad_to_max_cols(neg_edges_list)
-
-        neg_edges_tensor = neg_edges_tensor.to(self.device)
         graph_data.edge_index = graph_data.edge_index.to(self.device)
         graph_data.unique_edges = graph_data.unique_edges.to(self.device)
+        num_pos = graph_data.unique_edges.size(1)
+        B = len(neg_edges_list)
 
-        B, _, max_cols = neg_edges_tensor.shape
+        if self.negatives == "all":
+            neg_edge_index = torch.cat(neg_edges_list, dim=1).to(self.device)
+            neg_weights = torch.cat([
+                torch.full((t.size(1),), 1.0 / t.size(1)) for t in neg_edges_list]).to(self.device)
+            pos_neg_combined = torch.cat([graph_data.unique_edges, neg_edge_index], dim=1)
+            labels = torch.cat([torch.ones(num_pos, device=self.device),
+                                torch.zeros(neg_edge_index.size(1), device=self.device)])
+            weights = torch.cat([torch.ones(num_pos, device=self.device), neg_weights])
+            return {"mode": "all", "pos_neg_combined": pos_neg_combined, "labels": labels,
+                    "weights": weights, "norm": float(num_pos + B)}
+
+        neg_edges_tensor = repeat_pad_to_max_cols(neg_edges_list).to(self.device)
+        _, _, max_cols = neg_edges_tensor.shape
 
         # Pre-generate all random negative-column indices for all epochs at once. Shape: (num_epochs, B)
         all_rand_indices = torch.randint(
             0, max_cols, (num_epochs, B), device=self.device, generator=generator)
 
         # Pre-allocate labels (ones for positives, zeros for the B sampled negatives).
-        pos_labels = torch.ones(graph_data.unique_edges.size(1), device=self.device)
+        pos_labels = torch.ones(num_pos, device=self.device)
         neg_labels = torch.zeros(B, device=self.device)
         combined_labels = torch.cat([pos_labels, neg_labels], dim=0)
 
-        return neg_edges_tensor, all_rand_indices, combined_labels, B
+        return {"mode": "sampled", "neg_edges_tensor": neg_edges_tensor,
+                "all_rand_indices": all_rand_indices, "labels": combined_labels, "B": B}
 
-    def _train_epoch(self, autoencoder, optimizer, graph_data,
-                     neg_edges_tensor, all_rand_indices, combined_labels, B, epoch):
+    def _train_epoch(self, autoencoder, optimizer, graph_data, tensors, epoch):
         """Run one link-prediction training step and return the loss. Shared by train_gnn and CV."""
-        # --- PART 1: SAMPLING ---
-        current_indices = all_rand_indices[epoch]
-        neg_edge_index = neg_edges_tensor[torch.arange(B, device=self.device), :, current_indices].T
-        pos_neg_combined = torch.cat([graph_data.unique_edges, neg_edge_index], dim=1)
+        gram_ref = getattr(autoencoder, "gram_reference", None)
+        latent = None
+        if tensors["mode"] == "all":
+            pos_neg_similarities = autoencoder(graph_data.edge_index, tensors["pos_neg_combined"],
+                                               return_latent=gram_ref is not None)
+            if gram_ref is not None:
+                pos_neg_similarities, latent = pos_neg_similarities
+            loss = F.binary_cross_entropy(pos_neg_similarities, tensors["labels"],
+                                          weight=tensors["weights"], reduction="sum") / tensors["norm"]
+        else:
+            # --- PART 1: SAMPLING ---
+            B = tensors["B"]
+            current_indices = tensors["all_rand_indices"][epoch]
+            neg_edge_index = tensors["neg_edges_tensor"][
+                torch.arange(B, device=self.device), :, current_indices].T
+            pos_neg_combined = torch.cat([graph_data.unique_edges, neg_edge_index], dim=1)
 
-        # --- PART 2: FORWARD PASS ---
-        pos_neg_similarities = autoencoder(graph_data.edge_index, pos_neg_combined)
-        loss = F.binary_cross_entropy(pos_neg_similarities, combined_labels)
+            # --- PART 2: FORWARD PASS ---
+            pos_neg_similarities = autoencoder(graph_data.edge_index, pos_neg_combined,
+                                               return_latent=gram_ref is not None)
+            if gram_ref is not None:
+                pos_neg_similarities, latent = pos_neg_similarities
+            loss = F.binary_cross_entropy(pos_neg_similarities, tensors["labels"])
+
+        # Optional anchoring of the encoding table to its initialization.
+        anchor = getattr(autoencoder, "anchor_table", None)
+        if anchor is not None:
+            drift = autoencoder.node_embeddings.weight - anchor
+            loss = loss + self.anchor_weight * drift.pow(2).sum(dim=1).mean()
+
+        # Optional output Gram anchor on the sample nodes (nodes 0..num_samples-1).
+        if gram_ref is not None:
+            loss = loss + self.gram_anchor_weight * gram_discrepancy(
+                latent[:gram_ref.shape[0]], gram_ref)
 
         # --- PART 3: BACKWARD & STEP ---
         optimizer.zero_grad()
@@ -1022,16 +1157,45 @@ class Embedder(BaseEstimator, ClassifierMixin):
         optimizer.step()
         return loss
 
+    @torch.no_grad()
+    def _initialize_encodings(self, model, graph_data):
+        """Set the initial encoding table (spectral if requested) and the anchoring setup."""
+        weight = model.node_embeddings.weight
+        if self.init == "spectral":
+            table = spectral_encoding_table(
+                graph_data.unique_edges, graph_data.num_samples, graph_data.num_nodes,
+                model.node_to_embeddings, weight)
+            weight.copy_(table.to(weight.device))
+        if self.anchor_weight == float("inf"):
+            weight.requires_grad_(False)
+        elif self.anchor_weight > 0:
+            model.register_buffer("anchor_table", weight.detach().clone())
+        if self.gram_anchor_weight > 0:
+            reference = spectral_sample_embedding(
+                graph_data.unique_edges, graph_data.num_samples, graph_data.num_nodes,
+                min(self.gram_reference_components or weight.shape[1], weight.shape[1]))
+            model.register_buffer("gram_reference", reference.to(weight.device))
+
+    def _make_lr_scheduler(self, optimizer, num_epochs):
+        """LR scheduler decaying from `lr` to 0 over `num_epochs` (None for a constant lr)."""
+        if self.lr_schedule == "constant":
+            return None
+        if self.lr_schedule == "cosine":
+            return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=0.0)
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda e: max(0.0, 1.0 - e / num_epochs))
+
     def train_gnn(self, autoencoder, optimizer, graph_data):
-        neg_edges_tensor, all_rand_indices, combined_labels, B = self._prepare_training_tensors(
+        tensors = self._prepare_training_tensors(
             self._neg_edges_per_pair, graph_data, self.epochs)
+        scheduler = self._make_lr_scheduler(optimizer, self.epochs)
 
         # Inside your training loop:
         for epoch in range(self.epochs):
 
-            loss = self._train_epoch(
-                autoencoder, optimizer, graph_data,
-                neg_edges_tensor, all_rand_indices, combined_labels, B, epoch)
+            loss = self._train_epoch(autoencoder, optimizer, graph_data, tensors, epoch)
+            if scheduler is not None:
+                scheduler.step()
 
             if epoch % 10 == 0:
                 print(f"Step {epoch}: loss = {loss.item()}")
@@ -1122,6 +1286,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
                                       node_to_embeddings_index=graph_data.node_to_embeddings,
                                       variable_embeddings_ids=variable_embeddings_ids,
                                       bin_embedding_ids=bin_embedding_ids).to(self.device)
+        self._initialize_encodings(self.model, graph_data)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
         # Train model using link prediction loss.

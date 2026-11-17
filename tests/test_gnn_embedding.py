@@ -741,3 +741,238 @@ def test_raw_regressor_inputs_option():
                        embedder._variable_embeddings[k].detach().cpu())
     with pytest.raises(ValueError):
         Embedder(regressor_inputs="other")
+
+
+def test_training_noise_options_validated():
+    with pytest.raises(ValueError):
+        Embedder(lr_schedule="step")
+    with pytest.raises(ValueError):
+        Embedder(negatives="some")
+
+
+@pytest.mark.parametrize("schedule", ["cosine", "linear"])
+def test_lr_schedule_decays_to_zero(schedule):
+    make_deterministic(0)
+    embedder = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                        device=DEVICE, lr=0.01, lr_schedule=schedule)
+    # Record the lr the optimizer uses in each training epoch.
+    seen = []
+    orig = embedder._train_epoch
+    def spy(autoencoder, optimizer, *args):
+        seen.append(optimizer.param_groups[0]["lr"])
+        return orig(autoencoder, optimizer, *args)
+    embedder._train_epoch = spy
+    embedder.fit(example_df)
+    assert len(seen) == 40
+    assert seen[0] == pytest.approx(0.01)
+    assert all(a >= b for a, b in zip(seen, seen[1:]))
+    assert seen[-1] < 0.01 * 0.05
+
+
+def test_all_negatives_loss_is_expectation_of_sampled_loss():
+    import torch.nn.functional as F
+    from pome.models import GraphAutoencoder
+    make_deterministic(0)
+    e = Embedder(embedding_dimension=8, epochs=1, na_encoding=NA_ENCODING, negatives="all")
+    out = e.data_to_graph(example_df, dtype_col="type", ignore_na=NA_ENCODING, keep_na=[])
+    graph, neg = out[1], out[6]
+    model = GraphAutoencoder(int(graph.node_to_embeddings.max()) + 1, 8, "GAT",
+                             graph.node_to_embeddings, out[8], out[10])
+    t_all = e._prepare_training_tensors(neg, graph, 1)
+    with torch.no_grad():
+        p = model(graph.edge_index, t_all["pos_neg_combined"])
+        loss_all = F.binary_cross_entropy(p, t_all["labels"], weight=t_all["weights"],
+                                          reduction="sum") / t_all["norm"]
+        # Expectation of the sampled loss with a uniform choice among each pair's alternatives.
+        pos = model(graph.edge_index, graph.unique_edges)
+        pairs = [t for t in neg.values() if t.numel() > 0]
+        neg_terms = [F.binary_cross_entropy(model(graph.edge_index, t), torch.zeros(t.size(1)))
+                     for t in pairs]
+        expected = (F.binary_cross_entropy(pos, torch.ones_like(pos), reduction="sum")
+                    + torch.stack(neg_terms).sum()) / (pos.numel() + len(pairs))
+    assert loss_all.item() == pytest.approx(expected.item(), rel=1e-5)
+
+
+def test_all_negatives_fit_is_reproducible_and_supports_inductive():
+    def fit(**kw):
+        make_deterministic(3)
+        e = Embedder(epochs=30, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                     device=DEVICE, negatives="all", lr_schedule="cosine", **kw)
+        e.fit(example_df)
+        return e
+    a, b = fit(), fit()
+    assert np.allclose(a.get_embeddings()[0].to_numpy(), b.get_embeddings()[0].to_numpy())
+    ind = fit(inductive=True, cv_folds=2, cv_eval_every=10)
+    assert 10 <= ind._optimal_epochs <= 30
+    assert ind.get_embeddings()[0].shape == (NUM_SAMPLES, DIMENSION)
+
+
+def test_spectral_init_validated_and_deterministic():
+    from pome.models import GraphAutoencoder
+    with pytest.raises(ValueError):
+        Embedder(init="pca")
+    inputs = []
+    for seed in (0, 1):
+        make_deterministic(seed)
+        e = Embedder(embedding_dimension=8, epochs=1, na_encoding=NA_ENCODING, init="spectral")
+        out = e.data_to_graph(example_df, dtype_col="type", ignore_na=NA_ENCODING, keep_na=[])
+        graph = out[1]
+        model = GraphAutoencoder(int(graph.node_to_embeddings.max()) + 1, 8, "GAT",
+                                 graph.node_to_embeddings, out[8], out[10])
+        e._initialize_encodings(model, graph)
+        W = model.node_embeddings.weight.detach()
+        n2e = graph.node_to_embeddings
+        h0 = W[n2e[:, 0]] + W[n2e[:, 1]]
+        inputs.append(h0 / h0.norm(dim=1, keepdim=True))
+    # Node inputs no longer depend on the seed.
+    assert torch.allclose(inputs[0], inputs[1], atol=1e-6)
+    # Sample rows are unit-length spectral coordinates.
+    assert torch.allclose(W[:graph.num_samples].norm(dim=1),
+                          torch.ones(graph.num_samples), atol=1e-5)
+
+
+def test_spectral_init_fit_and_transform():
+    make_deterministic(0)
+    e = Embedder(epochs=30, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                 device=DEVICE, init="spectral", inductive=True, cv_folds=2, cv_eval_every=10)
+    e.fit(example_df)
+    emb = e.get_embeddings()[0]
+    assert emb.shape == (NUM_SAMPLES, DIMENSION) and np.isfinite(emb.to_numpy()).all()
+    new_df = example_df[SAMPLE_COLS[:2] + ["type"]]
+    assert e.transform(new_df).shape == (2, DIMENSION)
+
+
+def test_anchor_weight_limits_table_drift():
+    def drift(weight):
+        make_deterministic(0)
+        e = Embedder(epochs=40, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                     device=DEVICE, init="spectral", anchor_weight=weight)
+        init = {}
+        orig = e._initialize_encodings
+        def spy(model, graph):
+            orig(model, graph)
+            init["w"] = model.node_embeddings.weight.detach().clone()
+        e._initialize_encodings = spy
+        e.fit(example_df)
+        return (e.model.node_embeddings.weight.detach() - init["w"]).norm().item()
+    with pytest.raises(ValueError):
+        Embedder(anchor_weight=-1.0)
+    free, anchored, frozen = drift(0.0), drift(10.0), drift(float("inf"))
+    assert frozen == 0.0
+    assert anchored < free
+
+
+def test_gram_discrepancy_matches_direct_formula():
+    from pome.utils import gram_discrepancy
+    g = torch.Generator().manual_seed(0)
+    Z, X = torch.randn(20, 6, generator=g), torch.randn(20, 4, generator=g)
+    direct = ((Z @ Z.T - X @ X.T) ** 2).mean()
+    assert torch.allclose(gram_discrepancy(Z, X), direct, rtol=1e-5)
+    Q, _ = torch.linalg.qr(torch.randn(6, 6, generator=g))
+    assert torch.allclose(gram_discrepancy(Z @ Q, X), direct, rtol=1e-4)
+
+
+def test_gram_anchor_pulls_output_geometry_to_spectral_reference():
+    from pome.utils import gram_discrepancy, spectral_sample_embedding
+    with pytest.raises(ValueError):
+        Embedder(gram_anchor_weight=-1.0)
+    with pytest.raises(ValueError):
+        Embedder(gram_anchor_weight=float("inf"))
+
+    def discrepancy(weight):
+        make_deterministic(0)
+        e = Embedder(epochs=60, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                     device=DEVICE, init="spectral", gram_anchor_weight=weight)
+        e.fit(example_df)
+        assert (getattr(e.model, "gram_reference", None) is not None) == (weight > 0)
+        g = e._graph_data
+        ref = spectral_sample_embedding(g.unique_edges, g.num_samples, g.num_nodes, DIMENSION)
+        Z = torch.tensor(e.get_embeddings()[0].to_numpy(), dtype=torch.float32)
+        Z = Z / Z.norm(dim=1, keepdim=True)
+        return gram_discrepancy(Z, ref).item()
+
+    assert discrepancy(10.0) < discrepancy(0.0)
+
+
+def test_gram_anchor_with_inductive_cv_and_transform():
+    make_deterministic(0)
+    e = Embedder(epochs=30, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION,
+                 device=DEVICE, gram_anchor_weight=1.0, inductive=True, cv_folds=2,
+                 cv_eval_every=10)
+    e.fit(example_df)
+    assert np.isfinite(e.get_embeddings()[0].to_numpy()).all()
+    assert e.transform(example_df[SAMPLE_COLS[:2] + ["type"]]).shape == (2, DIMENSION)
+
+
+def test_zero_gat_output_does_not_produce_nan():
+    from pome.models import GraphAutoencoder
+    e = Embedder(embedding_dimension=8, epochs=1, na_encoding=NA_ENCODING)
+    out = e.data_to_graph(example_df, dtype_col="type", ignore_na=NA_ENCODING, keep_na=[])
+    graph = out[1]
+    model = GraphAutoencoder(int(graph.node_to_embeddings.max()) + 1, 8, "GAT",
+                             graph.node_to_embeddings, out[8], out[10])
+    model.encoder.forward = lambda x, edge_index: torch.zeros_like(x)  # all nodes dead
+    preds, latent = model(graph.edge_index, graph.unique_edges, return_latent=True)
+    assert torch.isfinite(preds).all() and torch.isfinite(latent).all()
+    assert torch.isfinite(model.get_embeddings(graph.edge_index)[0]).all()
+
+
+def test_zero_input_row_does_not_produce_nan():
+    # A sample whose values are all masked has an all-zero spectral input row (seen on MIMIC
+    # with 50% masking); the input normalization must not turn it into NaN.
+    from pome.models import GraphAutoencoder
+    e = Embedder(embedding_dimension=8, epochs=1, na_encoding=NA_ENCODING)
+    out = e.data_to_graph(example_df, dtype_col="type", ignore_na=NA_ENCODING, keep_na=[])
+    graph = out[1]
+    model = GraphAutoencoder(int(graph.node_to_embeddings.max()) + 1, 8, "GAT",
+                             graph.node_to_embeddings, out[8], out[10])
+    with torch.no_grad():
+        model.node_embeddings.weight.zero_()  # every input row is zero
+    preds, latent = model(graph.edge_index, graph.unique_edges, return_latent=True)
+    preds.sum().backward()
+    assert torch.isfinite(preds).all() and torch.isfinite(latent).all()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    assert torch.isfinite(model.get_embeddings(graph.edge_index)[0]).all()
+
+
+def test_gram_reference_components_selects_top_k():
+    from pome.utils import spectral_sample_embedding
+    for bad in (0, -1, 2.5, "2"):
+        with pytest.raises(ValueError):
+            Embedder(gram_reference_components=bad)
+    make_deterministic(0)
+    e = Embedder(epochs=20, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION, device=DEVICE,
+                 init="spectral", anchor_weight=float("inf"), gram_anchor_weight=10.0,
+                 gram_reference_components=2, inductive=True, cv_folds=2, cv_eval_every=10)
+    e.fit(example_df)
+    g = e._graph_data
+    ref = e.model.gram_reference.cpu()
+    assert ref.shape == (g.num_samples, 2)
+    assert torch.allclose(ref, spectral_sample_embedding(g.unique_edges, g.num_samples,
+                                                         g.num_nodes, 2))
+    assert np.isfinite(e.get_embeddings()[0].to_numpy()).all()
+
+
+def test_nystrom_sample_input_reproduces_training_rows():
+    make_deterministic(0)
+    e = Embedder(epochs=20, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION, device=DEVICE,
+                 init="spectral", anchor_weight=float("inf"), gram_anchor_weight=10.0)
+    e.fit(example_df)
+    g = e._graph_data
+    samples = [c for c in example_df.columns if c != e.type_column]
+    pairs = [e._sample_value_node_pairs(example_df.drop(columns=[e.type_column]), s)
+             for s in samples]
+    x = e._nystrom_sample_inputs(pairs)
+    w = e.model.node_embeddings.weight.detach().cpu()
+    rows = w[e.model.node_to_embeddings[:g.num_samples, 0].cpu()]
+    rows = rows / rows.norm(dim=1, keepdim=True)
+    cos = (x * rows).sum(1)
+    assert torch.allclose(cos, torch.ones_like(cos), atol=1e-4)
+    emb = e.transform(example_df, sample_input="nystrom")
+    assert emb.shape == (len(samples), DIMENSION) and np.isfinite(emb.to_numpy()).all()
+    with pytest.raises(ValueError):
+        e.transform(example_df, sample_input="bogus")
+    r = Embedder(epochs=5, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION, device=DEVICE)
+    r.fit(example_df)
+    with pytest.raises(ValueError):
+        r.transform(example_df, sample_input="nystrom")
