@@ -11,7 +11,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.model_selection import KFold
 import joblib
 from pome.models import GraphAutoencoder, ValueRegressor
-from pome.utils import spectral_encoding_table, spectral_sample_embedding, spectral_nystrom_projection, gram_discrepancy, compute_roc, matched_overfit_index, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
+from pome.utils import spectral_encoding_table, spectral_sample_embedding, gram_discrepancy, compute_roc, matched_overfit_index, repeat_pad_to_max_cols, bin_column_non_linear, bin_column_with_na_adjusted, signed_power_bins, get_zscore_bins
 
 def make_deterministic(seed=42):
     # 1. Basic seeding
@@ -49,12 +49,12 @@ class Embedder(BaseEstimator, ClassifierMixin):
                  regressor_lr : float = None,
                  regressor_weight_decay : float = 1e-4,
                  regressor_inputs : str = "invariant",
-                 lr_schedule : str = "constant",
+                 lr_schedule : str = "cosine",
                  negatives : str = "sampled",
-                 init : str = "random",
-                 anchor_weight : float = 0.0,
-                 gram_anchor_weight : float = 0.0,
-                 gram_reference_components : int = None,
+                 init : str = "spectral",
+                 anchor_weight : float = float("inf"),
+                 gram_anchor_weight : float = 10.0,
+                 gram_reference_components : int = 8,
                  inductive : bool = False,
                  cv_folds : int = 3,
                  cv_eval_every : int = 10,
@@ -103,35 +103,36 @@ class Embedder(BaseEstimator, ClassifierMixin):
         if regressor_inputs not in ("invariant", "raw"):
             raise ValueError("regressor_inputs must be 'invariant' or 'raw'.")
         self.regressor_inputs = regressor_inputs
-        # Learning-rate schedule of the GNN training. "constant" (default, POME <= 1.2): Adam at
-        # `lr` for all epochs. "cosine" / "linear": decay from `lr` to 0 over the trained epochs,
-        # so the parameters settle instead of ending at a random point of the optimizer's noise
-        # ball. Applies to the final training run only; the inductive epoch-tuning CV always uses
+        # Learning-rate schedule of the GNN training. "cosine" (default since 1.3) / "linear":
+        # decay from `lr` to 0 over the trained epochs, so the parameters settle instead of ending
+        # at a random point of the optimizer's noise ball. "constant" (POME <= 1.2): Adam at `lr`
+        # for all epochs. Applies to the final training run only; the inductive epoch-tuning CV always uses
         # a constant lr, since its folds run to the cap and their stopping epoch is not known in
         # advance.
         if lr_schedule not in ("constant", "cosine", "linear"):
             raise ValueError("lr_schedule must be 'constant', 'cosine' or 'linear'.")
         self.lr_schedule = lr_schedule
-        # Negatives of the link-prediction loss. "sampled" (default, POME <= 1.2): per positive
+        # Negatives of the link-prediction loss. "sampled" (default): per positive
         # sample-variable pair, one random alternative value of that variable per epoch. "all":
         # score every alternative value of the pair each epoch, each weighted 1/(#alternatives),
         # which is exactly the expectation of the sampled loss -- the loss becomes deterministic.
         if negatives not in ("sampled", "all"):
             raise ValueError("negatives must be 'sampled' or 'all'.")
         self.negatives = negatives
-        # Initialization of the encoding table. "random" (default, POME <= 1.2): Xavier-uniform rows
-        # scaled to unit length. "spectral": sample rows and value-node inputs start at the
-        # spectral embedding (degree-normalized SVD) of the bipartite sample-value graph; the
-        # shared variable / value rows are fitted to it by least squares (see
-        # utils.spectral_encoding_table). Deterministic given the data; only the GAT and decoder
-        # weights remain randomly initialized.
+        # Initialization of the encoding table. "spectral" (default since 1.3): sample rows and
+        # value-node inputs start at the spectral embedding (degree-normalized SVD) of the
+        # bipartite sample-value graph; the shared variable / value rows are fitted to it by least
+        # squares (see utils.spectral_encoding_table). Deterministic given the data; only the GAT
+        # and decoder weights remain randomly initialized. "random" (POME <= 1.2): Xavier-uniform
+        # rows scaled to unit length.
         if init not in ("random", "spectral"):
             raise ValueError("init must be 'random' or 'spectral'.")
         self.init = init
         # Anchoring of the encoding table to its initialization: adds
         # anchor_weight * mean_rows ||W - W_init||^2 to the link-prediction loss, so training stays
-        # near the (deterministic) spectral solution instead of drifting away from it. 0 disables it
-        # (default); float("inf") freezes the table entirely (only GAT and decoder are trained).
+        # near the (deterministic) spectral solution instead of drifting away from it.
+        # float("inf") (default since 1.3) freezes the table entirely (only GAT and decoder are
+        # trained); 0 disables the anchor and lets the table be learned freely (POME <= 1.2).
         # Meant for init="spectral"; with init="random" it anchors to the random draw.
         if not anchor_weight >= 0:
             raise ValueError("anchor_weight must be >= 0 (or float('inf')).")
@@ -141,12 +142,12 @@ class Embedder(BaseEstimator, ClassifierMixin):
         # spectral sample coordinates (utils.spectral_sample_embedding). It pins the sample-sample
         # cosine geometry of the output -- the quantity downstream clustering / kNN / probes see --
         # to a deterministic reference, while leaving rotations of the output free. Works with
-        # either init; 0 disables it (default).
+        # either init; default 10 (since 1.3), 0 disables it (POME <= 1.2).
         if not (gram_anchor_weight >= 0 and np.isfinite(gram_anchor_weight)):
             raise ValueError("gram_anchor_weight must be a finite number >= 0.")
         self.gram_anchor_weight = float(gram_anchor_weight)
         # Number k of leading non-trivial spectral components forming the Gram reference x_i
-        # (None = all embedding_dimension components). A small k keeps only the dominant,
+        # (default 8; None = all embedding_dimension components). A small k keeps only the dominant,
         # cluster-level structure of the spectral embedding; with all d components the reference
         # spreads the sample variance over many weak directions and dilutes cluster separation.
         if gram_reference_components is not None and not (
@@ -591,7 +592,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
         norms = latent.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
         return latent / norms
 
-    def transform(self, X, sample_input="zero"):
+    def transform(self, X):
         """Generate embeddings for new, unseen samples using the frozen trained encoder.
 
         The trained model weights are never updated (no retraining). Each new sample is added
@@ -612,18 +613,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
         Every sample must share at least one observed, in-vocabulary value with the training
         data; an edgeless sample (all values missing / unseen) has no signal and raises.
 
-        With a spectral encoding table (``init="spectral"``) a training sample's own input row
-        is its spectral coordinate, while the zero row of a new sample has no counterpart in
-        training. ``sample_input="nystrom"`` instead gives each new sample the Nystrom extension
-        of the spectral sample coordinates, computed from the value nodes it observes (see
-        ``utils.spectral_nystrom_projection``); for a training sample this reproduces its own
-        input row.
-
         Args:
             X (pd.DataFrame): New samples in the same format as the training data
                               (rows=variables, columns=new_samples+type_column).
-            sample_input (str): input row of the new sample nodes, ``"zero"`` (default) or
-                                ``"nystrom"`` (requires ``init="spectral"``).
 
         Returns:
             pd.DataFrame: Embedding matrix with shape (num_new_samples, embedding_dimension),
@@ -631,10 +623,6 @@ class Embedder(BaseEstimator, ClassifierMixin):
         """
         if not hasattr(self, '_graph_data'):
             raise ValueError("Run fit() first before calling transform()!")
-        if sample_input not in ("zero", "nystrom"):
-            raise ValueError("sample_input must be 'zero' or 'nystrom'.")
-        if sample_input == "nystrom" and getattr(self, "init", "random") != "spectral":
-            raise ValueError("sample_input='nystrom' requires a model fitted with init='spectral'.")
 
         input_data = X.copy()
         new_samples = [c for c in input_data.columns if c != self.type_column]
@@ -664,7 +652,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
 
         self.model.eval()
         with torch.no_grad():
-            latent, num_existing_nodes = self._inductive_forward(pairs_per_sample, sample_input)
+            latent, num_existing_nodes = self._inductive_forward(pairs_per_sample)
             new_latent = latent[num_existing_nodes:].cpu()
 
         embedding_cols = [f'dim_{i}' for i in range(self.embedding_dimension)]
@@ -799,23 +787,7 @@ class Embedder(BaseEstimator, ClassifierMixin):
             std_pred = self._value_regressor(sample_emb, var_emb).item()
         mean, std = self._reg_target_stats[variable]
         return std_pred * std + mean
-    def _nystrom_sample_inputs(self, pairs_per_sample):
-        """Nystrom-extended spectral input rows (unit length) for new samples, [n_new, d]."""
-        d = self.model.node_embeddings.weight.shape[1]
-        if getattr(self, "_nystrom_projection", None) is None:
-            g = self._graph_data
-            self._nystrom_projection = spectral_nystrom_projection(
-                g.unique_edges, g.num_samples, g.num_nodes, d)
-        P = self._nystrom_projection
-        num_samples = self._graph_data.num_samples
-        out = np.zeros((len(pairs_per_sample), d))
-        for i, pairs in enumerate(pairs_per_sample):
-            values = sorted({node for _, node in pairs})
-            out[i, :P.shape[1]] = P[np.asarray(values) - num_samples].sum(axis=0)
-        norm = np.linalg.norm(out, axis=1, keepdims=True)
-        return torch.tensor(out / np.maximum(norm, 1e-12), dtype=torch.float32)
-
-    def _inductive_forward(self, pairs_per_sample, sample_input="zero"):
+    def _inductive_forward(self, pairs_per_sample):
         """Inject new sample nodes into the frozen training graph and encode all nodes in one pass.
 
         Builds the augmented input feature matrix (frozen training-node embeddings, i.e.
@@ -839,13 +811,9 @@ class Embedder(BaseEstimator, ClassifierMixin):
         c2 = self.model.node_embeddings(self.model.node_to_embeddings[:, 1].to(device))
         training_embeds = c1 + c2
 
-        if sample_input == "nystrom":
-            new_sample_embeds = self._nystrom_sample_inputs(pairs_per_sample).to(
-                device=device, dtype=training_embeds.dtype)
-        else:
-            new_sample_embeds = torch.zeros(
-                len(pairs_per_sample), self.embedding_dimension,
-                device=device, dtype=training_embeds.dtype)
+        new_sample_embeds = torch.zeros(
+            len(pairs_per_sample), self.embedding_dimension,
+            device=device, dtype=training_embeds.dtype)
         augmented_embeds = torch.cat([training_embeds, new_sample_embeds], dim=0)
         augmented_edge_index = self._augmented_edge_index(
             pairs_per_sample, num_existing_nodes, device)

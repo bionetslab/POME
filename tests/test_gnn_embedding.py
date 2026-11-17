@@ -952,27 +952,3 @@ def test_gram_reference_components_selects_top_k():
                                                          g.num_nodes, 2))
     assert np.isfinite(e.get_embeddings()[0].to_numpy()).all()
 
-
-def test_nystrom_sample_input_reproduces_training_rows():
-    make_deterministic(0)
-    e = Embedder(epochs=20, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION, device=DEVICE,
-                 init="spectral", anchor_weight=float("inf"), gram_anchor_weight=10.0)
-    e.fit(example_df)
-    g = e._graph_data
-    samples = [c for c in example_df.columns if c != e.type_column]
-    pairs = [e._sample_value_node_pairs(example_df.drop(columns=[e.type_column]), s)
-             for s in samples]
-    x = e._nystrom_sample_inputs(pairs)
-    w = e.model.node_embeddings.weight.detach().cpu()
-    rows = w[e.model.node_to_embeddings[:g.num_samples, 0].cpu()]
-    rows = rows / rows.norm(dim=1, keepdim=True)
-    cos = (x * rows).sum(1)
-    assert torch.allclose(cos, torch.ones_like(cos), atol=1e-4)
-    emb = e.transform(example_df, sample_input="nystrom")
-    assert emb.shape == (len(samples), DIMENSION) and np.isfinite(emb.to_numpy()).all()
-    with pytest.raises(ValueError):
-        e.transform(example_df, sample_input="bogus")
-    r = Embedder(epochs=5, na_encoding=NA_ENCODING, embedding_dimension=DIMENSION, device=DEVICE)
-    r.fit(example_df)
-    with pytest.raises(ValueError):
-        r.transform(example_df, sample_input="nystrom")

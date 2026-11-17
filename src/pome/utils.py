@@ -275,34 +275,6 @@ def spectral_sample_embedding(unique_edges, num_samples, num_nodes, d):
     return torch.tensor(X, dtype=torch.float32)
 
 
-def spectral_nystrom_projection(unique_edges, num_samples, num_nodes, d):
-    """Per-value-node Nystrom weights for out-of-sample spectral sample coordinates.
-
-    For the degree-normalized biadjacency A_hat = D_s^-1/2 A D_v^-1/2 = U S V^T, a training
-    sample's spectral coordinate is x_i = U_i S^1/2 = A_hat_i V S^-1/2. The same map applied to
-    a new sample's (training-degree-normalized) row of value nodes N(s) gives
-
-        x_s = deg_s^-1/2 * sum_{v in N(s)} deg_v^-1/2 V_v S^-1/2,
-
-    which reproduces x_i exactly for a training sample. Since the coordinates are unit-normalized
-    afterwards, the deg_s factor can be dropped: x_s is proportional to the sum of the returned
-    rows P_v = deg_v^-1/2 V_v S^-1/2 over the sample's value nodes.
-
-    Returns:
-        ndarray[num_nodes - num_samples, c] (float64), c <= d; row v belongs to value node
-        num_samples + v. Uses the same components (and signs) as ``spectral_encoding_table``.
-    """
-    import scipy.sparse as sp
-
-    U, S, V = _spectral_components(unique_edges, num_samples, num_nodes, d)
-    src, dst = unique_edges.detach().cpu().numpy()
-    A = sp.csr_matrix((np.ones(len(src)), (src, dst - num_samples)),
-                      shape=(num_samples, num_nodes - num_samples))
-    A.data[:] = 1.0
-    deg_v = np.maximum(np.asarray(A.sum(axis=0)).ravel(), 1.0)
-    return V * (S ** -0.5) * (deg_v ** -0.5)[:, None]
-
-
 def gram_discrepancy(Z, X):
     """Mean squared difference of the Gram matrices, mean_ij (z_i.z_j - x_i.x_j)^2.
 

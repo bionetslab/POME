@@ -75,6 +75,15 @@ POME's Embedder class allows for the specification of the following parameters:
 - `epochs : int = 500`: Sets the number of epochs that POME is supposed to be trained.
 - `device : str = "cpu"`: Specifies whether to train on CPU ("cpu") or GPU ("cuda").
 
+### Training stability
+Since v1.3 POME trains with settings that make repeated runs (different seeds) yield nearly identical embeddings: the encoding table is initialized from the spectral embedding of the bipartite sample-value graph and kept frozen, the output geometry is anchored to its leading spectral components, and the learning rate decays to zero. Only the GAT encoder and the decoder are learned. Set `init="random", anchor_weight=0, gram_anchor_weight=0, lr_schedule="constant"` to reproduce POME ≤ 1.2.
+- `init : str = "spectral"`: Initialization of the encoding table - `"spectral"` (deterministic, from a degree-normalized SVD of the sample-value graph) or `"random"` (POME ≤ 1.2).
+- `anchor_weight : float = inf`: Penalty keeping the encoding table close to its initialization; `float("inf")` freezes the table, `0` lets it be learned freely.
+- `gram_anchor_weight : float = 10.0`: Weight of the penalty pulling the pairwise cosine similarities of the sample embeddings towards those of the spectral reference; `0` disables it.
+- `gram_reference_components : int = 8`: Number of leading spectral components forming that reference (`None` = all `embedding_dimension` components). Few components keep the dominant group structure and thus cluster separation.
+- `lr_schedule : str = "cosine"`: Learning-rate schedule - `"cosine"` or `"linear"` decay to zero, or `"constant"` (POME ≤ 1.2).
+- `negatives : str = "sampled"`: Negatives of the link-prediction loss - one sampled alternative value per positive pair and epoch (`"sampled"`), or all alternative values with equal weight (`"all"`, deterministic loss).
+
 ### Data handling
 - `type_column : str = "type"`: Name of the column storing the variable types.
 - `na_encoding : float = -99.0`: The float encoding value of missing data. Actual `NaN` entries are not supported and raise.
