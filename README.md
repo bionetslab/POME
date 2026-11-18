@@ -109,15 +109,10 @@ All of these are disabled by default and add no cost to the training loop when u
 After initializing the Embedder object, the main functions for using POME are:
 
 - `fit(X, y=None)`: Training POME on the given input dataframe, with the input format as specified above.
-- `get_embeddings()`: Return computed embeddings in dataframe format. Output is a four-tuple of sample embeddings (position 0), variable embeddings (position 1), continuous-bin embeddings (position 2), and a mapping from sample name to its row in the attention matrix (position 3). Variable embeddings are the learned variable encodings e_j, bin embeddings the (fixed) bin encodings e_b; bins that no value node uses are NaN. See the note below.
+- `get_embeddings()`: Return computed embeddings in dataframe format. Output is a four-tuple of sample embeddings (position 0), variable embeddings (position 1), continuous-bin embeddings (position 2), and a mapping from sample name to its row in the attention matrix (position 3). Variable embeddings are the learned variable encodings e_j, bin embeddings the (fixed) bin encodings e_b; bins that no value node uses are NaN.
 - `get_value_node_embeddings(level="input")`: Embeddings of all value nodes (categories and numeric bins), indexed `"variable=value"`. `level="input"` gives the normalized initial features fed into the encoder, `level="latent"` the encoder outputs (same space as the sample embeddings).
 - `transform(X)`: Embed new, unseen samples with the frozen trained encoder, without retraining. `X` must contain exactly the same variables as the training data plus the type column, and every sample must share at least one observed, known value with the training data — a sample whose values are all missing or unseen carries no signal and raises. Returns a `(num_new_samples, embedding_dimension)` dataframe.
 - `impute_all(na_value : float)`: Imputes all missing values specified by `na_value` in the input dataset, and directly returns the imputed dataframe. Categorical values are imputed by scoring candidate values with the trained decoder, continuous ones by a regression head on the sample encoding and the learned variable encoding e_j. Requires `enable_imputation=True`.
-
-
-### Note on variable encodings
-
-The input feature of a value node is the normalized sum of a variable encoding and a value encoding (`e_j + e_c` for categories, `e_j + e_b` for numeric bins). The value encodings `e_c` / `e_b` are fixed at their spectral initialization and only `e_j` is learned, so the learned `e_j` are uniquely determined by the training objective and can be compared directly, e.g. via cosine similarity. As for all embeddings, they are only defined up to a global rotation: cosine similarities and distances are unaffected, but raw coordinates of different runs should be aligned (e.g. by Procrustes) before being compared.
 
 
 ## License
